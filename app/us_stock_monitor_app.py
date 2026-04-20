@@ -1303,6 +1303,13 @@ def monitor_watchlist(
             continue
 
         latest = temp.iloc[-1]
+        recent_3 = temp.tail(3)
+        recent_green = (
+            recent_3.get("WVF_GREEN", pd.Series(dtype=bool)).fillna(False).astype(bool)
+            if enable_wvf_alert
+            else pd.Series(dtype=bool)
+        )
+        wvf_green_last_3d = bool(recent_green.any()) if enable_wvf_alert else False
         rows.append({
             "ticker": ticker,
             "action": derive_action_status(ticker, df, monitor_date),
@@ -1315,6 +1322,7 @@ def monitor_watchlist(
             "wvf_upper_band": float(latest.get("WVF_UPPER_BAND", np.nan)) if enable_wvf_alert else np.nan,
             "wvf_range_high": float(latest.get("WVF_RANGE_HIGH", np.nan)) if enable_wvf_alert else np.nan,
             "wvf_green_alert": bool(latest.get("WVF_GREEN", False)) if enable_wvf_alert else False,
+            "wvf_green_last_3d": wvf_green_last_3d,
             "monitor_note": "Rules pending",
         })
 
@@ -1537,11 +1545,15 @@ with tab1:
         passed = display_df[display_df["pass"] == True]
         st.markdown(f"**Passed stocks:** {len(passed)}")
         if not passed.empty:
+            if "close" in passed.columns and "screen_close" not in passed.columns:
+                passed = passed.copy()
+                passed["screen_close"] = passed["close"]
             preferred_passed_cols = [
                 "ticker",
                 "company_name",
                 "sector",
                 "business_nature",
+                "screen_close",
                 "score",
                 "technical_pass",
                 "fundamental_pass",
@@ -1559,7 +1571,6 @@ with tab1:
                 "revenue_value",
                 "market_cap_value",
                 "market_cap_pass",
-                "close",
                 "ret_63d",
                 "audit_close_stooq",
                 "audit_close_diff_pct",
@@ -1575,55 +1586,81 @@ with tab1:
 with tab2:
     st.subheader("Monitor a saved watchlist")
     files = list_saved_watchlists()
-    if not files:
-        st.info("No saved watchlist files yet.")
-    else:
+    uploaded_watchlist = st.file_uploader("Or upload watchlist CSV", type=["csv"], key="monitor_upload")
+
+    selected_path: Optional[Path] = None
+    if files:
         options = {p.name: p for p in files}
         selected_name = st.selectbox("Select saved watchlist", list(options.keys()))
         selected_path = options[selected_name]
+    else:
+        st.info("No saved watchlist files found. Upload a CSV below, or save one from tab 1 first.")
 
-        if st.button("Run monitor", use_container_width=True):
+    source_label = "none"
+    watchlist_df_to_monitor: Optional[pd.DataFrame] = None
+    if uploaded_watchlist is not None:
+        try:
+            watchlist_df_to_monitor = pd.read_csv(uploaded_watchlist)
+            source_label = f"upload:{uploaded_watchlist.name}"
+        except Exception as exc:
+            st.error(f"Failed to read uploaded watchlist CSV: {exc}")
+    elif selected_path is not None:
+        watchlist_df_to_monitor = load_watchlist(selected_path)
+        source_label = f"saved:{selected_path.name}"
+
+    if st.button("Run monitor", use_container_width=True):
+        if watchlist_df_to_monitor is None or watchlist_df_to_monitor.empty:
+            st.warning("Please select or upload a non-empty watchlist CSV first.")
+        else:
             st.session_state["monitor_df"] = monitor_watchlist(
-                load_watchlist(selected_path),
+                watchlist_df_to_monitor,
                 monitor_ts,
                 enable_wvf_alert=bool(enable_wvf_alert),
                 wvf_cfg=wvf_cfg,
             )
-            st.session_state["monitor_selected_path"] = selected_path
+            st.session_state["monitor_source_label"] = source_label
+            st.success("Monitor run completed.")
 
-        monitor_df = st.session_state.get("monitor_df")
-        monitor_selected_path = st.session_state.get("monitor_selected_path")
-        if monitor_df is not None and monitor_selected_path == selected_path:
-            st.dataframe(monitor_df, use_container_width=True)
+    monitor_df = st.session_state.get("monitor_df")
+    monitor_source_label = st.session_state.get("monitor_source_label")
+    if monitor_df is not None and monitor_source_label == source_label:
+        st.dataframe(monitor_df, use_container_width=True)
 
-            buy_count = int((monitor_df["action"] == "BUY").sum())
-            sell_count = int((monitor_df["action"] == "SELL").sum())
-            hold_count = int((monitor_df["action"] == "HOLD").sum())
-            watch_count = int((monitor_df["action"] == "WATCH").sum())
+        buy_count = int((monitor_df["action"] == "BUY").sum())
+        sell_count = int((monitor_df["action"] == "SELL").sum())
+        hold_count = int((monitor_df["action"] == "HOLD").sum())
+        watch_count = int((monitor_df["action"] == "WATCH").sum())
 
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("BUY", buy_count)
-            c2.metric("SELL", sell_count)
-            c3.metric("HOLD", hold_count)
-            c4.metric("WATCH", watch_count)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("BUY", buy_count)
+        c2.metric("SELL", sell_count)
+        c3.metric("HOLD", hold_count)
+        c4.metric("WATCH", watch_count)
 
-            if bool(enable_wvf_alert):
-                wvf_green_count = int((monitor_df["wvf_green_alert"] == True).sum())
-                st.metric("WVF Green Alerts", wvf_green_count)
-                if wvf_green_count > 0:
-                    green_names = monitor_df.loc[monitor_df["wvf_green_alert"] == True, "ticker"].astype(str).tolist()
-                    st.success(f"WVF alert: green bar detected for {wvf_green_count} ticker(s): {', '.join(green_names)}")
-                else:
-                    st.info("WVF alert: no green bars on monitor date.")
+        if bool(enable_wvf_alert):
+            wvf_green_today_count = int((monitor_df["wvf_green_alert"] == True).sum())
+            wvf_green_last3_count = int((monitor_df.get("wvf_green_last_3d", False) == True).sum())
+            c5, c6 = st.columns(2)
+            c5.metric("WVF Green (Monitor Date)", wvf_green_today_count)
+            c6.metric("WVF Green (Last 3 Trading Days)", wvf_green_last3_count)
 
-            if buy_count > 0:
-                st.warning("Action alert: at least one stock is in BUY zone.")
-            elif sell_count > 0:
-                st.error("Action alert: at least one stock is in SELL zone.")
+            if wvf_green_last3_count > 0:
+                green_names = monitor_df.loc[monitor_df["wvf_green_last_3d"] == True, "ticker"].astype(str).tolist()
+                st.success(
+                    f"WVF alert: {wvf_green_last3_count} ticker(s) showed a green signal within the last 3 trading days: "
+                    + ", ".join(green_names)
+                )
             else:
-                st.info("No BUY/SELL alerts yet. Current rules are still placeholders.")
+                st.info("WVF alert: no green bars in the last 3 trading days.")
+
+        if buy_count > 0:
+            st.warning("Action alert: at least one stock is in BUY zone.")
+        elif sell_count > 0:
+            st.error("Action alert: at least one stock is in SELL zone.")
         else:
-            st.info("Select a saved file and run monitor.")
+            st.info("No BUY/SELL alerts yet. Current rules are still placeholders.")
+    else:
+        st.info("Select/upload a watchlist, then click Run monitor.")
 
 with tab3:
     st.subheader("Saved watchlists")
