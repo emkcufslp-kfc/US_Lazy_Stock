@@ -1,0 +1,163 @@
+{
+  "generated_at_utc": "2026-04-20T11:53:37.264009+00:00",
+  "sources": {
+    "sp500_constituents": {
+      "url": "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
+      "ok": true,
+      "status_code": 200,
+      "bytes": 53641,
+      "rows": 503,
+      "columns": [
+        "Symbol",
+        "Security",
+        "GICS Sector",
+        "GICS Sub-Industry",
+        "Headquarters Location",
+        "Date added",
+        "CIK",
+        "Founded"
+      ],
+      "missing_columns": []
+    },
+    "sp500_financials": {
+      "url": "https://raw.githubusercontent.com/datasets/s-and-p-500-companies-financials/main/data/constituents-financials.csv",
+      "ok": true,
+      "status_code": 200,
+      "bytes": 97313,
+      "rows": 503,
+      "columns": [
+        "Symbol",
+        "Name",
+        "Sector",
+        "Price",
+        "Price/Earnings",
+        "Dividend Yield",
+        "Earnings/Share",
+        "52 Week Low",
+        "52 Week High",
+        "Market Cap",
+        "EBITDA",
+        "Price/Sales",
+        "Price/Book",
+        "SEC Filings"
+      ],
+      "missing_columns": []
+    },
+    "ate329_all": {
+      "url": "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/all.csv",
+      "ok": true,
+      "status_code": 200,
+      "bytes": 464318,
+      "rows": 5398,
+      "columns": [
+        "symbol",
+        "name",
+        "price",
+        "marketCap",
+        "volume",
+        "industry"
+      ],
+      "missing_columns": []
+    },
+    "ate329_sp500": {
+      "url": "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv",
+      "ok": true,
+      "status_code": 200,
+      "bytes": 41355,
+      "rows": 503,
+      "columns": [
+        "symbol",
+        "name",
+        "price",
+        "marketCap",
+        "volume",
+        "industry"
+      ],
+      "missing_columns": []
+    },
+    "rreichel_nasdaq": {
+      "url": "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_tickers.txt",
+      "ok": true,
+      "status_code": 200,
+      "bytes": 20752,
+      "rows": 4107,
+      "unique_rows": 4107,
+      "invalid_rows": 0
+    },
+    "rreichel_nyse": {
+      "url": "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nyse/nyse_tickers.txt",
+      "ok": true,
+      "status_code": 200,
+      "bytes": 12115,
+      "rows": 3078,
+      "unique_rows": 2355,
+      "invalid_rows": 0
+    },
+    "rreichel_amex": {
+      "url": "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/amex/amex_tickers.txt",
+      "ok": true,
+      "status_code": 200,
+      "bytes": 1331,
+      "rows": 308,
+      "unique_rows": 286,
+      "invalid_rows": 0
+    },
+    "us_market_data": {
+      "url": "https://raw.githubusercontent.com/SteelCerberus/us-market-data/main/data/us_market_data.csv",
+      "ok": true,
+      "status_code": 200,
+      "bytes": 5412659,
+      "rows": 35254,
+      "columns": [
+        "Date",
+        "Close",
+        "Adjusted Close",
+        "Swap Rate",
+        "Risk Free Rate",
+        "Risk Free Return",
+        "CPI",
+        "Inflation",
+        "Total Real Return",
+        "Real Return"
+      ],
+      "missing_columns": []
+    },
+    "sp500_macro": {
+      "url": "https://raw.githubusercontent.com/datasets/s-and-p-500/main/data/data.csv",
+      "ok": true,
+      "status_code": 200,
+      "bytes": 123596,
+      "rows": 1864,
+      "columns": [
+        "Date",
+        "SP500",
+        "Dividend",
+        "Earnings",
+        "Consumer Price Index",
+        "Long Interest Rate",
+        "Real Price",
+        "Real Dividend",
+        "Real Earnings",
+        "PE10"
+      ],
+      "missing_columns": []
+    }
+  },
+  "cross_checks": {
+    "sp500_symbol_overlap": {
+      "ok": true,
+      "source_a_count": 503,
+      "source_b_count": 501,
+      "overlap_count": 501,
+      "jaccard": 0.996,
+      "rule": "jaccard >= 0.80"
+    },
+    "history_row_sanity": {
+      "ok": true,
+      "us_market_data_rows": 35254,
+      "sp500_macro_rows": 1864,
+      "rule": "us_market_data_rows > 20000 and sp500_macro_rows > 1000"
+    }
+  },
+  "overall_ok": true
+}

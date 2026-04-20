@@ -116,6 +116,36 @@ def add_wvf_indicator(df: pd.DataFrame, wvf_cfg: WVFConfig) -> pd.DataFrame:
     return out
 
 
+def _normalize_ticker_series(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.upper().str.strip().str.replace(".", "-", regex=False)
+    return s[s.str.match(r"^[A-Z][A-Z0-9\\-]*$")]
+
+
+def _fetch_reference_csv(url: str, required_cols: List[str], timeout_sec: int = 20) -> Optional[pd.DataFrame]:
+    try:
+        resp = requests.get(url, timeout=timeout_sec, headers={"User-Agent": "USLazyStock/1.0"})
+        resp.raise_for_status()
+        df = pd.read_csv(StringIO(resp.text))
+        if not set(required_cols).issubset(set(df.columns)):
+            return None
+        if df.empty:
+            return None
+        return df
+    except Exception:
+        return None
+
+
+def _fetch_reference_txt_lines(url: str, timeout_sec: int = 20) -> List[str]:
+    try:
+        resp = requests.get(url, timeout=timeout_sec, headers={"User-Agent": "USLazyStock/1.0"})
+        resp.raise_for_status()
+        lines = [x.strip().upper().replace(".", "-") for x in resp.text.splitlines() if x.strip()]
+        lines = [x for x in lines if pd.Series([x]).str.match(r"^[A-Z][A-Z0-9\\-]*$").iloc[0]]
+        return lines
+    except Exception:
+        return []
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
 def load_sp500_profiles() -> pd.DataFrame:
     def _normalize(
@@ -165,7 +195,34 @@ def load_sp500_profiles() -> pd.DataFrame:
     except Exception as exc:
         errors.append(f"DataHub: {exc}")
 
-    # Source 3: Small local fallback so app remains usable offline/restricted
+    # Source 3 (reference-only fallback): GitHub datasets mirror
+    gh_constituents = _fetch_reference_csv(
+        "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv",
+        required_cols=["Symbol", "Security", "GICS Sector"],
+    )
+    if gh_constituents is not None:
+        return _normalize(gh_constituents, "Symbol", "Security", "GICS Sector", "GICS Sub-Industry")
+    errors.append("GitHub datasets/s-and-p-500-companies unavailable or invalid.")
+
+    # Source 4 (reference-only fallback): GitHub S&P 500 financials mirror
+    gh_financials = _fetch_reference_csv(
+        "https://raw.githubusercontent.com/datasets/s-and-p-500-companies-financials/main/data/constituents-financials.csv",
+        required_cols=["Symbol", "Name", "Sector"],
+    )
+    if gh_financials is not None:
+        return _normalize(gh_financials, "Symbol", "Name", "Sector", "Sector")
+    errors.append("GitHub datasets/s-and-p-500-companies-financials unavailable or invalid.")
+
+    # Source 5 (reference-only fallback): community daily S&P 500 list
+    gh_sp500 = _fetch_reference_csv(
+        "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/sp500.csv",
+        required_cols=["symbol", "name", "industry"],
+    )
+    if gh_sp500 is not None:
+        return _normalize(gh_sp500, "symbol", "name", "industry", "industry")
+    errors.append("GitHub Ate329/top-us-stock-tickers unavailable or invalid.")
+
+    # Source 6: Small local fallback so app remains usable offline/restricted
     fallback = [
         ("AAPL", "Apple Inc.", "Information Technology", "Consumer Electronics"),
         ("MSFT", "Microsoft Corporation", "Information Technology", "Systems Software"),
@@ -216,7 +273,43 @@ def load_nasdaq_profiles() -> pd.DataFrame:
         }).drop_duplicates(subset=["ticker"]).sort_values("ticker").reset_index(drop=True)
         return out
     except Exception:
-        return pd.DataFrame(columns=["ticker", "company_name", "sector", "business_nature"])
+        pass
+
+    # Reference-only fallback A: community daily list with sector metadata
+    gh_all = _fetch_reference_csv(
+        "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/all.csv",
+        required_cols=["symbol", "name", "industry"],
+    )
+    if gh_all is not None:
+        out = pd.DataFrame({
+            "ticker": _normalize_ticker_series(gh_all["symbol"]),
+            "company_name": gh_all["name"].astype(str).str.strip(),
+            "sector": gh_all["industry"].astype(str).str.strip().replace("", "N/A"),
+            "business_nature": gh_all["industry"].astype(str).str.strip().replace("", "N/A"),
+        })
+        out = out.dropna(subset=["ticker"]).drop_duplicates(subset=["ticker"]).sort_values("ticker").reset_index(drop=True)
+        if not out.empty:
+            return out
+
+    # Reference-only fallback B: symbol-only lists from US-Stock-Symbols
+    urls = [
+        "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nasdaq/nasdaq_tickers.txt",
+        "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/nyse/nyse_tickers.txt",
+        "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/amex/amex_tickers.txt",
+    ]
+    tickers: List[str] = []
+    for u in urls:
+        tickers.extend(_fetch_reference_txt_lines(u))
+    tickers = sorted(set(tickers))
+    if tickers:
+        return pd.DataFrame({
+            "ticker": tickers,
+            "company_name": ["N/A"] * len(tickers),
+            "sector": ["N/A"] * len(tickers),
+            "business_nature": ["N/A"] * len(tickers),
+        })
+
+    return pd.DataFrame(columns=["ticker", "company_name", "sector", "business_nature"])
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
@@ -1444,36 +1537,36 @@ with tab1:
         passed = display_df[display_df["pass"] == True]
         st.markdown(f"**Passed stocks:** {len(passed)}")
         if not passed.empty:
+            preferred_passed_cols = [
+                "ticker",
+                "company_name",
+                "sector",
+                "business_nature",
+                "score",
+                "technical_pass",
+                "fundamental_pass",
+                "fundamental_rules_hit",
+                "eps_ge_min_qtrs",
+                "eps_consec_qtrs",
+                "rev_ge_min_qtrs",
+                "rev_consec_qtrs",
+                "annual_revenue_uptrend",
+                "roe_3y_avg_value",
+                "roe_stable",
+                "roe_quality",
+                "eps_yoy_value",
+                "rev_yoy_value",
+                "revenue_value",
+                "market_cap_value",
+                "market_cap_pass",
+                "close",
+                "ret_63d",
+                "audit_close_stooq",
+                "audit_close_diff_pct",
+            ]
+            available_passed_cols = [c for c in preferred_passed_cols if c in passed.columns]
             st.dataframe(
-                passed[
-                    [
-                        "ticker",
-                        "company_name",
-                        "sector",
-                        "business_nature",
-                        "score",
-                        "technical_pass",
-                        "fundamental_pass",
-                        "fundamental_rules_hit",
-                        "eps_ge_min_qtrs",
-                        "eps_consec_qtrs",
-                        "rev_ge_min_qtrs",
-                        "rev_consec_qtrs",
-                        "annual_revenue_uptrend",
-                        "roe_3y_avg_value",
-                        "roe_stable",
-                        "roe_quality",
-                        "eps_yoy_value",
-                        "rev_yoy_value",
-                        "revenue_value",
-                        "market_cap_value",
-                        "market_cap_pass",
-                        "close",
-                        "ret_63d",
-                        "audit_close_stooq",
-                        "audit_close_diff_pct",
-                    ]
-                ],
+                passed[available_passed_cols] if available_passed_cols else passed,
                 use_container_width=True,
             )
     else:

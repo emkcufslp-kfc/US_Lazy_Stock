@@ -58,6 +58,7 @@ streamlit run app/us_stock_monitor_app.py
 
 ```bash
 python -m py_compile app/us_stock_monitor_app.py
+python scripts/validate_reference_sources.py
 ```
 
 ## Backtest Script
@@ -76,3 +77,5 @@ python backtest/us_stock_template_backtest.py \
 ## Notes
 - For strict point-in-time fundamentals, replace free-source workflows with filing-grade pipelines.
 - BUY / SELL / HOLD zone logic is currently placeholder-only.
+- Additional GitHub datasets are kept as **reference-only fallbacks** (not primary truth).
+- Fallback source verification report is generated at `docs/reference_validation_report.json`.
