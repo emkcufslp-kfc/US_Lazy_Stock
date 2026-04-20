@@ -1337,7 +1337,7 @@ with st.sidebar:
     st.header("Input")
     use_offline_sample_data = st.checkbox(
         "Use offline sample data (no live API)",
-        value=True,
+        value=False,
         help="Loads bundled sample scan results from data/full_screen_latest.csv and skips live market/fundamental calls.",
     )
     tickers_text = st.text_area(
@@ -1403,6 +1403,14 @@ wvf_cfg = WVFConfig(
 
 as_of_ts = pd.Timestamp(screen_date)
 monitor_ts = pd.Timestamp(monitor_date)
+selected_screen_date_str = as_of_ts.strftime("%Y-%m-%d")
+prev_selected_screen_date = st.session_state.get("selected_screen_date_str")
+if prev_selected_screen_date is not None and prev_selected_screen_date != selected_screen_date_str:
+    # Prevent stale table/save behavior when user changes date but has not rerun scan yet.
+    st.session_state.pop("screen_df", None)
+    st.session_state.pop("screen_result_date", None)
+    st.session_state.pop("screen_result_mode", None)
+st.session_state["selected_screen_date_str"] = selected_screen_date_str
 
 manual_tickers = [x.strip().upper() for x in tickers_text.split(",") if x.strip()]
 always_include = [x.strip().upper() for x in always_include_text.split(",") if x.strip()]
@@ -1476,6 +1484,11 @@ with tab1:
     )
     st.caption("Pass logic: require at least N of 3 fundamental rules (EPS, Revenue, ROE), plus market cap.")
     st.caption("ROE formula: Net Income / Shareholders' Equity")
+    last_run_date = st.session_state.get("screen_result_date")
+    if last_run_date:
+        st.caption(f"Last screen run date: {last_run_date}")
+    if last_run_date and last_run_date != selected_screen_date_str:
+        st.warning("Screen date changed. Please click Run screen to refresh results for the newly selected date.")
     if use_offline_sample_data:
         st.caption(universe_note)
         if not universe_preview.empty:
@@ -1496,6 +1509,8 @@ with tab1:
             if use_offline_sample_data:
                 try:
                     st.session_state["screen_df"] = load_sample_screen_data().copy()
+                    st.session_state["screen_result_date"] = selected_screen_date_str
+                    st.session_state["screen_result_mode"] = "offline_sample"
                     st.success("Loaded bundled sample screen results.")
                 except Exception as exc:
                     st.error(f"Failed to load sample screen data: {exc}")
@@ -1519,6 +1534,8 @@ with tab1:
                         enable_sec_audit=bool(enable_sec_audit),
                         sec_audit_limit=int(sec_audit_limit),
                     )
+                    st.session_state["screen_result_date"] = selected_screen_date_str
+                    st.session_state["screen_result_mode"] = "live_scan"
                     st.success("Screen completed.")
 
     with right:
@@ -1531,7 +1548,8 @@ with tab1:
                 if passed.empty:
                     st.warning("No passed stocks to save.")
                 else:
-                    path = save_watchlist(passed, as_of_ts)
+                    result_date_str = st.session_state.get("screen_result_date", selected_screen_date_str)
+                    path = save_watchlist(passed, pd.Timestamp(result_date_str))
                     st.success(f"Saved: {path.name}")
 
     screen_df = st.session_state.get("screen_df")
