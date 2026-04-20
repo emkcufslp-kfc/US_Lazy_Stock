@@ -17,6 +17,7 @@ import yfinance as yf
 APP_DIR = Path(__file__).resolve().parent
 WATCHLIST_DIR = APP_DIR / "saved_watchlists"
 WATCHLIST_DIR.mkdir(exist_ok=True, parents=True)
+SAMPLE_SCREEN_PATH = APP_DIR.parent / "data" / "full_screen_latest.csv"
 AUTO_UNIVERSE_TOP_N = 500
 
 
@@ -30,7 +31,22 @@ class ScreenConfig:
     require_fundamentals: bool = True
     require_close_above_mas: bool = True
     require_ma_stack: bool = True
-    roe_stability_max_std: float = 8.0
+    roe_stability_max_std: float = 40.0
+    use_tradingview_setup: bool = True
+    min_market_cap: float = 10_000_000_000.0
+    fundamental_mode: str = "gemini_yoy"
+    apply_technical_filter: bool = False
+    min_fundamental_rules_pass: int = 2
+
+
+@dataclass
+class WVFConfig:
+    lookback_std_high: int = 22
+    bollinger_length: int = 20
+    bollinger_mult: float = 2.0
+    lookback_percentile: int = 50
+    high_percentile: float = 0.85
+    low_percentile: float = 1.01
 
 
 @st.cache_data(show_spinner=False)
@@ -76,6 +92,27 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["HIGH_52W"] = close.rolling(252, min_periods=252).max()
     out["LOW_52W"] = close.rolling(252, min_periods=252).min()
     out["RET_63D"] = close.pct_change(63)
+    return out
+
+
+def add_wvf_indicator(df: pd.DataFrame, wvf_cfg: WVFConfig) -> pd.DataFrame:
+    out = df.copy()
+    if "Close" not in out.columns or "Low" not in out.columns:
+        return out
+    highest_close = out["Close"].rolling(wvf_cfg.lookback_std_high, min_periods=wvf_cfg.lookback_std_high).max()
+    wvf = ((highest_close - out["Low"]) / highest_close) * 100.0
+    sdev = wvf_cfg.bollinger_mult * wvf.rolling(wvf_cfg.bollinger_length, min_periods=wvf_cfg.bollinger_length).std()
+    midline = wvf.rolling(wvf_cfg.bollinger_length, min_periods=wvf_cfg.bollinger_length).mean()
+    upper_band = midline + sdev
+    range_high = wvf.rolling(wvf_cfg.lookback_percentile, min_periods=wvf_cfg.lookback_percentile).max() * wvf_cfg.high_percentile
+    range_low = wvf.rolling(wvf_cfg.lookback_percentile, min_periods=wvf_cfg.lookback_percentile).min() * wvf_cfg.low_percentile
+    green = (wvf >= upper_band) | (wvf >= range_high)
+
+    out["WVF"] = wvf
+    out["WVF_UPPER_BAND"] = upper_band
+    out["WVF_RANGE_HIGH"] = range_high
+    out["WVF_RANGE_LOW"] = range_low
+    out["WVF_GREEN"] = green.fillna(False)
     return out
 
 
@@ -154,6 +191,48 @@ def load_sp500_tickers() -> List[str]:
     return load_sp500_profiles()["ticker"].tolist()
 
 
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def load_nasdaq_profiles() -> pd.DataFrame:
+    try:
+        url = "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+        resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        df = pd.read_csv(StringIO(resp.text), sep="|")
+        if "Symbol" not in df.columns:
+            return pd.DataFrame(columns=["ticker", "company_name", "sector", "business_nature"])
+        df = df[df["Symbol"].astype(str).str.upper() != "FILE CREATION TIME:"].copy()
+        if "Test Issue" in df.columns:
+            df = df[df["Test Issue"].astype(str).str.upper() == "N"]
+        if "ETF" in df.columns:
+            df = df[df["ETF"].astype(str).str.upper() == "N"]
+        df["ticker"] = df["Symbol"].astype(str).str.upper().str.strip().str.replace(".", "-", regex=False)
+        df = df[df["ticker"].str.match(r"^[A-Z][A-Z0-9\\-]*$")]
+        name_col = "Security Name" if "Security Name" in df.columns else "ticker"
+        out = pd.DataFrame({
+            "ticker": df["ticker"],
+            "company_name": df[name_col].astype(str).str.strip(),
+            "sector": "N/A",
+            "business_nature": "N/A",
+        }).drop_duplicates(subset=["ticker"]).sort_values("ticker").reset_index(drop=True)
+        return out
+    except Exception:
+        return pd.DataFrame(columns=["ticker", "company_name", "sector", "business_nature"])
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def load_combined_universe_profiles() -> pd.DataFrame:
+    sp = load_sp500_profiles().copy()
+    sp["source_rank"] = 0
+    nq = load_nasdaq_profiles().copy()
+    nq["source_rank"] = 1
+    out = pd.concat([sp, nq], ignore_index=True)
+    out["company_name"] = out["company_name"].fillna("N/A")
+    out["sector"] = out["sector"].fillna("N/A")
+    out["business_nature"] = out["business_nature"].fillna("N/A")
+    out = out.sort_values(["source_rank", "ticker"]).drop_duplicates(subset=["ticker"], keep="first")
+    return out[["ticker", "company_name", "sector", "business_nature"]].reset_index(drop=True)
+
+
 def build_profile_map(tickers: List[str]) -> Dict[str, Dict[str, str]]:
     prof = load_sp500_profiles()
     lookup = {
@@ -193,6 +272,7 @@ def load_live_fundamentals_yf(ticker: str) -> Dict[str, object]:
     eps_yoy_value = info.get("earningsQuarterlyGrowth")
     rev_yoy_value = info.get("revenueGrowth")
     roe_avg = info.get("returnOnEquity")
+    revenue_value = info.get("totalRevenue")
     to_pct = lambda v: float(v) * 100.0 if v is not None and pd.notna(v) else np.nan
     return {
         "company_name": company_name,
@@ -201,6 +281,156 @@ def load_live_fundamentals_yf(ticker: str) -> Dict[str, object]:
         "eps_yoy_value": to_pct(eps_yoy_value),
         "rev_yoy_value": to_pct(rev_yoy_value),
         "roe_avg": to_pct(roe_avg),
+        "revenue_value": float(revenue_value) if revenue_value is not None and pd.notna(revenue_value) else np.nan,
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def load_market_cap_yf(ticker: str) -> float:
+    try:
+        tk = yf.Ticker(ticker)
+        fi = getattr(tk, "fast_info", None)
+        if fi is not None:
+            mc = fi.get("market_cap")
+            if mc is not None and pd.notna(mc):
+                return float(mc)
+        info = tk.get_info()
+        mc2 = info.get("marketCap")
+        if mc2 is not None and pd.notna(mc2):
+            return float(mc2)
+    except Exception:
+        pass
+    return np.nan
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def load_tradingview_like_fundamentals_yf(ticker: str) -> Dict[str, object]:
+    tk = yf.Ticker(ticker)
+    qis = tk.quarterly_income_stmt
+    qbs = tk.quarterly_balance_sheet
+
+    if qis is None or qis.empty:
+        return {}
+
+    qis = qis.copy()
+    qis.columns = pd.to_datetime(qis.columns)
+    qis = qis.sort_index(axis=1)
+
+    eps_row = "Diluted EPS" if "Diluted EPS" in qis.index else ("Basic EPS" if "Basic EPS" in qis.index else None)
+    rev_row = "Total Revenue" if "Total Revenue" in qis.index else None
+
+    eps_q = pd.to_numeric(qis.loc[eps_row], errors="coerce").dropna() if eps_row else pd.Series(dtype=float)
+    rev_q = pd.to_numeric(qis.loc[rev_row], errors="coerce").dropna() if rev_row else pd.Series(dtype=float)
+
+    eps_qoq = (eps_q.pct_change() * 100.0).dropna()
+    rev_qoq = (rev_q.pct_change() * 100.0).dropna()
+
+    roe_ttm_series = pd.Series(dtype=float)
+    if qbs is not None and not qbs.empty and "Net Income" in qis.index and "Stockholders Equity" in qbs.index:
+        qbs2 = qbs.copy()
+        qbs2.columns = pd.to_datetime(qbs2.columns)
+        qbs2 = qbs2.sort_index(axis=1)
+        ni_q = pd.to_numeric(qis.loc["Net Income"], errors="coerce").dropna()
+        eq_q = pd.to_numeric(qbs2.loc["Stockholders Equity"], errors="coerce").dropna()
+        df = pd.DataFrame({"ni": ni_q, "eq": eq_q}).dropna().sort_index()
+        vals = []
+        idxs = []
+        for i in range(3, len(df)):
+            w = df.iloc[i - 3 : i + 1]
+            ttm_ni = float(w["ni"].sum())
+            avg_eq = float(w["eq"].mean())
+            if avg_eq == 0:
+                continue
+            vals.append((ttm_ni / avg_eq) * 100.0)
+            idxs.append(w.index[-1])
+        if vals:
+            roe_ttm_series = pd.Series(vals, index=idxs, dtype=float).sort_index()
+
+    return {
+        "eps_qoq_series": eps_qoq.tail(4).tolist(),
+        "rev_qoq_series": rev_qoq.tail(4).tolist(),
+        "roe_ttm_series": roe_ttm_series.tail(4).tolist(),
+        "eps_qoq_value": float(eps_qoq.iloc[-1]) if not eps_qoq.empty else np.nan,
+        "rev_qoq_value": float(rev_qoq.iloc[-1]) if not rev_qoq.empty else np.nan,
+        "roe_fq_value": float(roe_ttm_series.iloc[-1]) if not roe_ttm_series.empty else np.nan,
+        "revenue_value": float(rev_q.iloc[-1]) if not rev_q.empty else np.nan,
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def load_gemini_like_fundamentals_yf(ticker: str) -> Dict[str, object]:
+    tk = yf.Ticker(ticker)
+    qis = tk.quarterly_income_stmt
+    if qis is None or qis.empty:
+        return {}
+
+    qis = qis.copy()
+    qis.columns = pd.to_datetime(qis.columns)
+    qis = qis.sort_index(axis=1)
+
+    eps_row = "Diluted EPS" if "Diluted EPS" in qis.index else ("Basic EPS" if "Basic EPS" in qis.index else None)
+    rev_row = "Total Revenue" if "Total Revenue" in qis.index else None
+
+    eps_q = pd.to_numeric(qis.loc[eps_row], errors="coerce").dropna() if eps_row else pd.Series(dtype=float)
+    rev_q = pd.to_numeric(qis.loc[rev_row], errors="coerce").dropna() if rev_row else pd.Series(dtype=float)
+
+    eps_yoy = (eps_q / eps_q.shift(4) - 1.0) * 100.0 if len(eps_q) >= 5 else pd.Series(dtype=float)
+    rev_yoy = (rev_q / rev_q.shift(4) - 1.0) * 100.0 if len(rev_q) >= 5 else pd.Series(dtype=float)
+    eps_yoy = eps_yoy.dropna()
+    rev_yoy = rev_yoy.dropna()
+
+    # ROE 3Y: annual Net Income / Stockholders Equity
+    ai = tk.income_stmt
+    ab = tk.balance_sheet
+    roe_year_vals = pd.Series(dtype=float)
+    if ai is not None and not ai.empty and ab is not None and not ab.empty and "Net Income" in ai.index and "Stockholders Equity" in ab.index:
+        ai2 = ai.copy()
+        ab2 = ab.copy()
+        ai2.columns = pd.to_datetime(ai2.columns)
+        ab2.columns = pd.to_datetime(ab2.columns)
+        ni = pd.to_numeric(ai2.loc["Net Income"], errors="coerce")
+        eq = pd.to_numeric(ab2.loc["Stockholders Equity"], errors="coerce")
+        tmp = pd.DataFrame({"ni": ni, "eq": eq}).dropna()
+        tmp = tmp[tmp["eq"] != 0].sort_index()
+        if not tmp.empty:
+            roe_year_vals = (tmp["ni"] / tmp["eq"]) * 100.0
+
+    eps_list = eps_yoy.tail(4).tolist()
+    rev_list = rev_yoy.tail(4).tolist()
+    roe_list = roe_year_vals.tail(3).tolist()
+    revenue_value = float(rev_q.iloc[-1]) if not rev_q.empty else np.nan
+
+    # Backfill from SEC when Yahoo quarterly history is too short for 3~4 YoY checks.
+    sec = load_sec_fundamentals_for_rules(ticker, pd.Timestamp("today").normalize().strftime("%Y-%m-%d"))
+    if len(eps_list) < 3:
+        sec_eps = sec.get("eps_yoy_list", []) if isinstance(sec, dict) else []
+        if sec_eps:
+            eps_list = list(pd.Series(sec_eps, dtype=float).tail(4).values)
+    if len(rev_list) < 3:
+        sec_rev = sec.get("rev_yoy_list", []) if isinstance(sec, dict) else []
+        if sec_rev:
+            rev_list = list(pd.Series(sec_rev, dtype=float).tail(4).values)
+    if len(roe_list) < 3:
+        sec_roe = sec.get("roe_year_values", []) if isinstance(sec, dict) else []
+        if sec_roe:
+            roe_list = list(pd.Series(sec_roe, dtype=float).tail(3).values)
+    if pd.isna(revenue_value):
+        sec_rev_fy = sec.get("rev_fy_list", []) if isinstance(sec, dict) else []
+        if sec_rev_fy:
+            revenue_value = float(pd.Series(sec_rev_fy, dtype=float).dropna().iloc[-1])
+
+    eps_s = pd.Series(eps_list, dtype=float)
+    rev_s = pd.Series(rev_list, dtype=float)
+    roe_s = pd.Series(roe_list, dtype=float)
+
+    return {
+        "eps_yoy_series": eps_list,
+        "rev_yoy_series": rev_list,
+        "roe_year_series": roe_list,
+        "eps_yoy_value": float(eps_s.iloc[-1]) if not eps_s.empty else np.nan,
+        "rev_yoy_value": float(rev_s.iloc[-1]) if not rev_s.empty else np.nan,
+        "roe_avg": float(roe_s.mean()) if not roe_s.empty else np.nan,
+        "revenue_value": revenue_value,
     }
 
 
@@ -266,6 +496,34 @@ def _sec_collect_recent_quarter_yoy(
     as_of_date: pd.Timestamp,
     max_points: int = 4,
 ) -> List[float]:
+    def _pick_single_quarter_rows(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        d = df.copy()
+        d["filed"] = pd.to_datetime(d.get("filed"), errors="coerce")
+        d["frame"] = d.get("frame", "").astype(str)
+        d["has_q_frame"] = d["frame"].str.match(r"^CY\\d{4}Q[1-4]$")
+        d["cal_year"] = d["end"].dt.year
+        # Prefer frame year when present.
+        frame_year = pd.to_numeric(d["frame"].str.extract(r"^CY(\\d{4})Q[1-4]")[0], errors="coerce")
+        d.loc[frame_year.notna(), "cal_year"] = frame_year[frame_year.notna()].astype(int)
+        if "start" in d.columns:
+            d["start"] = pd.to_datetime(d.get("start"), errors="coerce")
+            d["dur_days"] = (d["end"] - d["start"]).dt.days
+        else:
+            d["dur_days"] = np.nan
+
+        # Keep one row per quarter endpoint:
+        # prefer explicit quarterly frame, then shorter duration (~90d), then latest filing.
+        picked = []
+        for _, g in d.groupby(["end", "fp"], dropna=False):
+            g2 = g.copy()
+            g2["dur_rank"] = g2["dur_days"].fillna(9999)
+            g2 = g2.sort_values(["has_q_frame", "dur_rank", "filed"], ascending=[False, True, False])
+            picked.append(g2.iloc[0])
+        out = pd.DataFrame(picked).sort_values("end")
+        return out
+
     for tax in _sec_iter_taxonomies(facts):
         for tag in tags:
             units = ((tax.get(tag) or {}).get("units") or {})
@@ -283,10 +541,10 @@ def _sec_collect_recent_quarter_yoy(
             df = df[(df["fp"].isin(["Q1", "Q2", "Q3", "Q4"])) & (df["end"] <= as_of_date)]
             if df.empty:
                 continue
-            df = df.sort_values("end")
+            df = _pick_single_quarter_rows(df)
             yoy_vals: List[float] = []
             for _, latest in df.iterrows():
-                prior = df[(df["fy"] == latest["fy"] - 1) & (df["fp"] == latest["fp"])]
+                prior = df[(df["cal_year"] == latest["cal_year"] - 1) & (df["fp"] == latest["fp"])]
                 if prior.empty:
                     continue
                 pv = float(prior.sort_values("end").iloc[-1]["val"])
@@ -329,6 +587,13 @@ def _sec_collect_recent_fy_values(
 
 
 def _sec_pick_roe_avg(facts: dict, as_of_date: pd.Timestamp) -> float:
+    roe_vals = _sec_collect_roe_year_values(facts, as_of_date, max_points=3)
+    if not roe_vals:
+        return np.nan
+    return float(pd.Series(roe_vals, dtype=float).mean())
+
+
+def _sec_collect_roe_year_values(facts: dict, as_of_date: pd.Timestamp, max_points: int = 3) -> List[float]:
     for tax in _sec_iter_taxonomies(facts):
         ni_tag_candidates = ["NetIncomeLoss", "ProfitLoss"]
         eq_tag_candidates = ["StockholdersEquity", "Equity"]
@@ -364,9 +629,10 @@ def _sec_pick_roe_avg(facts: dict, as_of_date: pd.Timestamp) -> float:
         merged = merged[(merged["equity"] != 0)].sort_values("fy").tail(3)
         if merged.empty:
             continue
-        roe = (merged["net_income"] / merged["equity"]) * 100.0
-        return float(roe.mean())
-    return np.nan
+        roe = ((merged["net_income"] / merged["equity"]) * 100.0).astype(float).tolist()
+        if roe:
+            return roe[-max_points:]
+    return []
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
@@ -392,11 +658,13 @@ def load_sec_fundamentals_for_rules(ticker: str, as_of_date: str) -> Dict[str, o
         rev_fy_list = _sec_collect_recent_fy_values(
             facts, ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet", "Revenue"], as_of
         )
+        roe_year_values = _sec_collect_roe_year_values(facts, as_of, max_points=3)
         roe_avg = _sec_pick_roe_avg(facts, as_of)
         return {
             "eps_yoy_list": eps_yoy_list,
             "rev_yoy_list": rev_yoy_list,
             "rev_fy_list": rev_fy_list,
+            "roe_year_values": roe_year_values,
             "roe_avg": roe_avg,
         }
     except Exception:
@@ -431,7 +699,8 @@ def load_sec_fundamentals_audit(ticker: str, as_of_date: str) -> Dict[str, float
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
 def top_volume_universe(as_of_date: str, top_n: int = AUTO_UNIVERSE_TOP_N, lookback_days: int = 60) -> Tuple[List[str], pd.DataFrame]:
-    tickers = load_sp500_tickers()
+    profiles = load_combined_universe_profiles()
+    tickers = profiles["ticker"].tolist()
     start = (pd.Timestamp(as_of_date) - pd.Timedelta(days=max(lookback_days * 2, 150))).strftime("%Y-%m-%d")
     end = (pd.Timestamp(as_of_date) + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
 
@@ -473,8 +742,7 @@ def top_volume_universe(as_of_date: str, top_n: int = AUTO_UNIVERSE_TOP_N, lookb
     if vol_df.empty:
         raise ValueError("No valid volume series found for universe selection.")
     vol_df = vol_df.sort_values("avg_volume", ascending=False).head(top_n).reset_index(drop=True)
-    sp500_profiles = load_sp500_profiles()
-    vol_df = vol_df.merge(sp500_profiles, on="ticker", how="left")
+    vol_df = vol_df.merge(profiles, on="ticker", how="left")
     vol_df["company_name"] = vol_df["company_name"].fillna("N/A")
     vol_df["sector"] = vol_df["sector"].fillna("N/A")
     vol_df["business_nature"] = vol_df["business_nature"].fillna(vol_df["sector"]).fillna("N/A")
@@ -516,112 +784,157 @@ def eval_fundamental(
     fdf: Optional[pd.DataFrame],
     cfg: ScreenConfig,
 ) -> Tuple[bool, Dict[str, object]]:
-    def _max_consecutive_ge(series: pd.Series, threshold: float) -> int:
-        run = 0
-        best = 0
-        for v in series.dropna().tolist():
-            if float(v) >= threshold:
-                run += 1
+    if cfg.fundamental_mode == "gemini_yoy":
+        gm = load_gemini_like_fundamentals_yf(ticker)
+        eps_yoy = pd.Series(gm.get("eps_yoy_series", []), dtype=float)
+        rev_yoy = pd.Series(gm.get("rev_yoy_series", []), dtype=float)
+        roe_year = pd.Series(gm.get("roe_year_series", []), dtype=float)
+
+        def _max_consecutive_ge(series: pd.Series, threshold: float) -> int:
+            run = 0
+            best = 0
+            for v in series.dropna().tolist():
+                run = run + 1 if float(v) >= threshold else 0
                 if run > best:
                     best = run
-            else:
-                run = 0
-        return best
+            return best
 
-    row = get_fund_row(ticker, as_of_date, fdf)
-    source = "csv"
-    eps_vals = pd.Series(dtype=float)
-    rev_vals = pd.Series(dtype=float)
-    rev_fy_vals = pd.Series(dtype=float)
-    roe_vals = pd.Series(dtype=float)
-    roe_avg = np.nan
-    note = ""
-    fundamentals_used = True
+        eps_ge_min_qtrs = int((eps_yoy >= cfg.min_eps_yoy).sum()) if not eps_yoy.empty else 0
+        rev_ge_min_qtrs = int((rev_yoy >= cfg.min_revenue_yoy).sum()) if not rev_yoy.empty else 0
+        eps_consec_qtrs = _max_consecutive_ge(eps_yoy, cfg.min_eps_yoy)
+        rev_consec_qtrs = _max_consecutive_ge(rev_yoy, cfg.min_revenue_yoy)
 
-    if row is not None:
-        eps_cols = [c for c in ["eps_q1_yoy", "eps_q2_yoy", "eps_q3_yoy", "eps_q4_yoy"] if c in row.index]
-        rev_cols = [c for c in ["revenue_q1_yoy", "revenue_q2_yoy", "revenue_q3_yoy", "revenue_q4_yoy"] if c in row.index]
-        roe_cols = [c for c in ["roe_y1", "roe_y2", "roe_y3"] if c in row.index]
-        rev_fy_cols = [c for c in ["revenue_y1", "revenue_y2", "revenue_y3"] if c in row.index]
-        eps_vals = pd.to_numeric(row[eps_cols], errors="coerce") if eps_cols else pd.Series(dtype=float)
-        rev_vals = pd.to_numeric(row[rev_cols], errors="coerce") if rev_cols else pd.Series(dtype=float)
-        rev_fy_vals = pd.to_numeric(row[rev_fy_cols], errors="coerce") if rev_fy_cols else pd.Series(dtype=float)
-        roe_vals = pd.to_numeric(row[roe_cols], errors="coerce") if roe_cols else pd.Series(dtype=float)
-        roe_avg = float(roe_vals.mean()) if len(roe_vals) >= 1 else np.nan
-    else:
-        sec = load_sec_fundamentals_for_rules(ticker, as_of_date.strftime("%Y-%m-%d"))
-        if sec:
-            source = "sec_companyfacts"
-            eps_vals = pd.Series(sec.get("eps_yoy_list", []), dtype=float)
-            rev_vals = pd.Series(sec.get("rev_yoy_list", []), dtype=float)
-            rev_fy_vals = pd.Series(sec.get("rev_fy_list", []), dtype=float)
-            roe_avg = float(sec.get("roe_avg", np.nan)) if sec.get("roe_avg", np.nan) is not None else np.nan
-        else:
-            live = load_live_fundamentals_yf(ticker)
-            source = "yahoo_proxy"
-            eps_val = live.get("eps_yoy_value", np.nan)
-            rev_val = live.get("rev_yoy_value", np.nan)
-            roe_avg = live.get("roe_avg", np.nan)
-            eps_vals = pd.Series([eps_val] if pd.notna(eps_val) else [], dtype=float)
-            rev_vals = pd.Series([rev_val] if pd.notna(rev_val) else [], dtype=float)
+        # Relaxed growth thresholds:
+        # Prioritize latest quarter momentum, otherwise fall back to broader continuity checks.
+        latest_eps_yoy = float(eps_yoy.iloc[-1]) if not eps_yoy.empty else np.nan
+        latest_rev_yoy = float(rev_yoy.iloc[-1]) if not rev_yoy.empty else np.nan
+        eps_pass = bool(
+            (pd.notna(latest_eps_yoy) and latest_eps_yoy >= cfg.min_eps_yoy)
+            or (len(eps_yoy) >= 3 and eps_ge_min_qtrs >= 2 and eps_consec_qtrs >= 1)
+        )
+        rev_pass = bool(
+            (pd.notna(latest_rev_yoy) and latest_rev_yoy >= cfg.min_revenue_yoy)
+            or (len(rev_yoy) >= 3 and rev_ge_min_qtrs >= 2 and rev_consec_qtrs >= 1)
+        )
 
-    eps_ge_min_qtrs = int((eps_vals >= cfg.min_eps_yoy).sum()) if len(eps_vals) > 0 else 0
-    rev_ge_min_qtrs = int((rev_vals >= cfg.min_revenue_yoy).sum()) if len(rev_vals) > 0 else 0
-    eps_pass = eps_ge_min_qtrs >= 3 if len(eps_vals) >= 3 else False
-    eps_consec_qtrs = _max_consecutive_ge(eps_vals, cfg.min_eps_yoy)
-    rev_consec_qtrs = _max_consecutive_ge(rev_vals, cfg.min_revenue_yoy)
-    annual_revenue_uptrend = bool(
-        len(rev_fy_vals.dropna()) >= 3 and
-        rev_fy_vals.dropna().iloc[-1] > rev_fy_vals.dropna().iloc[-2] > rev_fy_vals.dropna().iloc[-3]
+        roe_avg = float(roe_year.tail(3).mean()) if len(roe_year) >= 1 else np.nan
+        roe_year_tail = roe_year.tail(3)
+        roe_ge_min_years = int((roe_year_tail >= cfg.min_roe_avg).sum()) if len(roe_year_tail) >= 1 else 0
+        roe_each_ge_min = bool(len(roe_year_tail) >= 3 and roe_ge_min_years >= 1)
+        roe_std = float(roe_year.tail(3).std()) if len(roe_year) >= 2 else np.nan
+        roe_stable = bool(pd.notna(roe_std) and roe_std <= cfg.roe_stability_max_std)
+        roe_pass = bool(pd.notna(roe_avg) and roe_avg >= cfg.min_roe_avg and roe_each_ge_min and roe_stable)
+
+        market_cap_value = load_market_cap_yf(ticker)
+        market_cap_pass = bool(pd.notna(market_cap_value) and market_cap_value >= cfg.min_market_cap)
+
+        strict_depth_ok = pd.notna(market_cap_value)
+        fundamental_rules_hit = int(bool(eps_pass)) + int(bool(rev_pass)) + int(bool(roe_pass))
+        fund_final_pass = bool(fundamental_rules_hit >= int(cfg.min_fundamental_rules_pass) and market_cap_pass and strict_depth_ok)
+        if not cfg.require_fundamentals:
+            fund_final_pass = True
+
+        return fund_final_pass, {
+            "fundamentals_used": True,
+            "fundamentals_source": "gemini_yoy_yf",
+            "eps_pass": bool(eps_pass),
+            "rev_pass": bool(rev_pass),
+            "roe_pass": bool(roe_pass),
+            "market_cap_pass": bool(market_cap_pass),
+            "roe_avg": roe_avg,
+            "eps_yoy_value": gm.get("eps_yoy_value", np.nan),
+            "rev_yoy_value": gm.get("rev_yoy_value", np.nan),
+            "revenue_value": gm.get("revenue_value", np.nan),
+            "market_cap_value": market_cap_value,
+            "eps_ge_min_qtrs": eps_ge_min_qtrs,
+            "rev_ge_min_qtrs": rev_ge_min_qtrs,
+            "eps_consec_qtrs": eps_consec_qtrs,
+            "rev_consec_qtrs": rev_consec_qtrs,
+            "annual_revenue_uptrend": np.nan,
+            "roe_std": roe_std,
+            "roe_stable": roe_stable,
+            "roe_each_ge_min": roe_each_ge_min,
+            "roe_quality": "better(>17)" if pd.notna(roe_avg) and roe_avg > 17 else "ok(>15)",
+            "eps_vals": eps_yoy.tolist(),
+            "rev_vals": rev_yoy.tolist(),
+            "fundamental_rules_hit": fundamental_rules_hit,
+            "note": "Gemini match setup (relaxed): YoY EPS/Revenue continuity + 3Y ROE + market cap filter",
+        }
+
+    tv = load_tradingview_like_fundamentals_yf(ticker)
+    eps_qoq = pd.Series(tv.get("eps_qoq_series", []), dtype=float)
+    rev_qoq = pd.Series(tv.get("rev_qoq_series", []), dtype=float)
+    roe_ttm = pd.Series(tv.get("roe_ttm_series", []), dtype=float)
+
+    eps_ge_min_qtrs = int((eps_qoq >= cfg.min_eps_yoy).sum()) if not eps_qoq.empty else 0
+    rev_ge_min_qtrs = int((rev_qoq >= cfg.min_revenue_yoy).sum()) if not rev_qoq.empty else 0
+    eps_consec_qtrs = 0
+    rev_consec_qtrs = 0
+    run = 0
+    for v in eps_qoq.tolist():
+        run = run + 1 if v >= cfg.min_eps_yoy else 0
+        eps_consec_qtrs = max(eps_consec_qtrs, run)
+    run = 0
+    for v in rev_qoq.tolist():
+        run = run + 1 if v >= cfg.min_revenue_yoy else 0
+        rev_consec_qtrs = max(rev_consec_qtrs, run)
+
+    # User criteria (relaxed):
+    # - EPS growth > min threshold for at least 2 consecutive quarters
+    # - Revenue growth > min threshold for at least 2 consecutive quarters, with >=2 hits in recent 3~4 quarters
+    latest_eps_qoq = float(eps_qoq.iloc[-1]) if not eps_qoq.empty else np.nan
+    latest_rev_qoq = float(rev_qoq.iloc[-1]) if not rev_qoq.empty else np.nan
+    eps_pass = bool(
+        (pd.notna(latest_eps_qoq) and latest_eps_qoq >= cfg.min_eps_yoy)
+        or (len(eps_qoq) >= 2 and eps_consec_qtrs >= 2 and eps_ge_min_qtrs >= 2)
     )
-    rev_pass = (rev_consec_qtrs >= 3) or annual_revenue_uptrend
-    roe_pass = roe_avg >= cfg.min_roe_avg if pd.notna(roe_avg) else False
-    roe_std = float(roe_vals.dropna().std()) if len(roe_vals.dropna()) >= 2 else np.nan
-    roe_stable = (roe_std <= cfg.roe_stability_max_std) if pd.notna(roe_std) else True
-    roe_pass = bool(roe_pass and roe_stable)
-    roe_quality = "better(>17)" if pd.notna(roe_avg) and roe_avg > 17 else "ok(>15)"
-    eps_yoy_value = float(eps_vals.dropna().iloc[-1]) if not eps_vals.dropna().empty else np.nan
-    rev_yoy_value = float(rev_vals.dropna().iloc[-1]) if not rev_vals.dropna().empty else np.nan
+    rev_pass = bool(
+        (pd.notna(latest_rev_qoq) and latest_rev_qoq >= cfg.min_revenue_yoy)
+        or (len(rev_qoq) >= 3 and rev_consec_qtrs >= 2 and rev_ge_min_qtrs >= 2)
+    )
 
-    if source == "yahoo_proxy":
-        note = "Yahoo proxy fundamentals (not 4-quarter SEC/CSV series)"
-        fundamentals_used = True
-    elif source == "sec_companyfacts":
-        note = "Fundamentals from SEC Company Facts"
-        fundamentals_used = True
-    elif source == "csv":
-        note = "Fundamentals from uploaded CSV"
-        fundamentals_used = True
+    roe_avg = float(roe_ttm.mean()) if not roe_ttm.empty else np.nan
+    roe_std = float(roe_ttm.std()) if len(roe_ttm) >= 2 else np.nan
+    roe_ttm_tail = roe_ttm.tail(3)
+    roe_ge_min_years = int((roe_ttm_tail >= cfg.min_roe_avg).sum()) if len(roe_ttm_tail) >= 1 else 0
+    roe_each_ge_min = bool(len(roe_ttm_tail) >= 3 and roe_ge_min_years >= 1)
+    roe_stable = bool(pd.notna(roe_std) and roe_std <= cfg.roe_stability_max_std)
+    roe_pass = bool(pd.notna(roe_avg) and roe_avg >= cfg.min_roe_avg and roe_each_ge_min and roe_stable)
 
-    # If strict fundamentals are required and only proxy data exists, enforce failure.
-    strict_depth_ok = len(eps_vals) >= 3 and (len(rev_vals) >= 3 or len(rev_fy_vals.dropna()) >= 3) and pd.notna(roe_avg)
-    if source == "yahoo_proxy" and cfg.require_fundamentals:
-        strict_depth_ok = False
+    market_cap_value = load_market_cap_yf(ticker)
+    market_cap_pass = bool(pd.notna(market_cap_value) and market_cap_value >= cfg.min_market_cap)
 
-    fund_final_pass = bool(eps_pass and rev_pass and roe_pass and strict_depth_ok)
-    if not fund_final_pass and not note:
-        note = "Insufficient fundamentals depth"
+    strict_depth_ok = pd.notna(market_cap_value)
+    fundamental_rules_hit = int(bool(eps_pass)) + int(bool(rev_pass)) + int(bool(roe_pass))
+    fund_final_pass = bool(fundamental_rules_hit >= int(cfg.min_fundamental_rules_pass) and market_cap_pass and strict_depth_ok)
+    if not cfg.require_fundamentals:
+        fund_final_pass = True
 
-    return fund_final_pass if cfg.require_fundamentals else True, {
-        "fundamentals_used": fundamentals_used,
-        "fundamentals_source": source,
+    return fund_final_pass, {
+        "fundamentals_used": True,
+        "fundamentals_source": "tradingview_yf_qoq",
         "eps_pass": bool(eps_pass),
         "rev_pass": bool(rev_pass),
         "roe_pass": bool(roe_pass),
+        "market_cap_pass": bool(market_cap_pass),
         "roe_avg": roe_avg,
-        "eps_yoy_value": eps_yoy_value,
-        "rev_yoy_value": rev_yoy_value,
+        "eps_yoy_value": tv.get("eps_qoq_value", np.nan),
+        "rev_yoy_value": tv.get("rev_qoq_value", np.nan),
+        "revenue_value": tv.get("revenue_value", np.nan),
+        "market_cap_value": market_cap_value,
         "eps_ge_min_qtrs": eps_ge_min_qtrs,
         "rev_ge_min_qtrs": rev_ge_min_qtrs,
         "eps_consec_qtrs": eps_consec_qtrs,
         "rev_consec_qtrs": rev_consec_qtrs,
-        "annual_revenue_uptrend": annual_revenue_uptrend,
+        "annual_revenue_uptrend": np.nan,
         "roe_std": roe_std,
         "roe_stable": roe_stable,
-        "roe_quality": roe_quality,
-        "eps_vals": list(eps_vals.values),
-        "rev_vals": list(rev_vals.values),
-        "note": note,
+        "roe_each_ge_min": roe_each_ge_min,
+        "roe_quality": "better(>17)" if pd.notna(roe_avg) and roe_avg > 17 else "ok(>15)",
+        "eps_vals": eps_qoq.tolist(),
+        "rev_vals": rev_qoq.tolist(),
+        "fundamental_rules_hit": fundamental_rules_hit,
+        "note": "TradingView setup (relaxed): EPS/Revenue QoQ continuity + ROE + Market Cap > min",
     }
 
 
@@ -734,6 +1047,18 @@ def load_watchlist(path: Path) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
+@st.cache_data(show_spinner=False)
+def load_sample_screen_data() -> pd.DataFrame:
+    df = pd.read_csv(SAMPLE_SCREEN_PATH)
+    if "pass" in df.columns:
+        raw = df["pass"]
+        if raw.dtype == bool:
+            df["pass"] = raw
+        else:
+            df["pass"] = raw.astype(str).str.lower().isin({"true", "1", "yes", "y"})
+    return df
+
+
 def screen_on_date(
     tickers: List[str],
     as_of_date: pd.Timestamp,
@@ -773,13 +1098,14 @@ def screen_on_date(
             fund["eps_yoy_value"] = live.get("eps_yoy_value", fund.get("eps_yoy_value"))
             fund["rev_yoy_value"] = live.get("rev_yoy_value", fund.get("rev_yoy_value"))
             fund["roe_avg"] = live.get("roe_avg", fund.get("roe_avg"))
+            fund["revenue_value"] = live.get("revenue_value", fund.get("revenue_value"))
             if profile.get("company_name") == "N/A":
                 profile["company_name"] = str(live.get("company_name", "N/A"))
             if profile.get("sector") == "N/A":
                 profile["sector"] = str(live.get("sector", "N/A"))
             if profile.get("business_nature") == "N/A":
                 profile["business_nature"] = str(live.get("business_nature", "N/A"))
-        final_pass = tech_pass and fund_pass
+        final_pass = (tech_pass if cfg.apply_technical_filter else True) and fund_pass
 
         score = 0
         score += 1 if tech.get("above_mas") else 0
@@ -789,6 +1115,7 @@ def screen_on_date(
         score += 1 if fund.get("eps_pass") else 0
         score += 1 if fund.get("rev_pass") else 0
         score += 1 if fund.get("roe_pass") else 0
+        score += 1 if fund.get("market_cap_pass") else 0
         audit_close = np.nan
         audit_diff_pct = np.nan
         if enable_audit and idx < int(audit_limit):
@@ -823,7 +1150,9 @@ def screen_on_date(
             "ret_63d": tech.get("ret_63d"),
             "eps_yoy_value": fund.get("eps_yoy_value", np.nan),
             "rev_yoy_value": fund.get("rev_yoy_value", np.nan),
+            "revenue_value": fund.get("revenue_value", np.nan),
             "roe_3y_avg_value": fund.get("roe_avg", np.nan),
+            "fundamental_rules_hit": fund.get("fundamental_rules_hit", np.nan),
             "eps_ge_min_qtrs": fund.get("eps_ge_min_qtrs", np.nan),
             "rev_ge_min_qtrs": fund.get("rev_ge_min_qtrs", np.nan),
             "eps_consec_qtrs": fund.get("eps_consec_qtrs", np.nan),
@@ -832,8 +1161,11 @@ def screen_on_date(
             "eps_pass": fund.get("eps_pass", np.nan),
             "rev_pass": fund.get("rev_pass", np.nan),
             "roe_pass": fund.get("roe_pass", np.nan),
+            "market_cap_pass": fund.get("market_cap_pass", np.nan),
+            "market_cap_value": fund.get("market_cap_value", np.nan),
             "roe_std": fund.get("roe_std", np.nan),
             "roe_stable": fund.get("roe_stable", np.nan),
+            "roe_each_ge_min": fund.get("roe_each_ge_min", np.nan),
             "roe_quality": fund.get("roe_quality", "N/A"),
             "audit_close_stooq": audit_close,
             "audit_close_diff_pct": audit_diff_pct,
@@ -849,12 +1181,20 @@ def screen_on_date(
     return out.sort_values(["pass", "score", "ret_63d"], ascending=[False, False, False]).reset_index(drop=True)
 
 
-def monitor_watchlist(watchlist_df: pd.DataFrame, monitor_date: pd.Timestamp) -> pd.DataFrame:
+def monitor_watchlist(
+    watchlist_df: pd.DataFrame,
+    monitor_date: pd.Timestamp,
+    enable_wvf_alert: bool = False,
+    wvf_cfg: Optional[WVFConfig] = None,
+) -> pd.DataFrame:
     tickers = watchlist_df["ticker"].astype(str).str.upper().tolist()
     start = (monitor_date - pd.Timedelta(days=450)).strftime("%Y-%m-%d")
     end = (monitor_date + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
     price_data = download_price_history(tickers, start, end)
     price_data = {t: add_indicators(df) for t, df in price_data.items()}
+    if enable_wvf_alert:
+        cfg = wvf_cfg or WVFConfig()
+        price_data = {t: add_wvf_indicator(df, cfg) for t, df in price_data.items()}
 
     rows = []
     for _, row in watchlist_df.iterrows():
@@ -878,6 +1218,10 @@ def monitor_watchlist(watchlist_df: pd.DataFrame, monitor_date: pd.Timestamp) ->
             "ma50": float(latest.get("MA50", np.nan)),
             "ma150": float(latest.get("MA150", np.nan)),
             "ma200": float(latest.get("MA200", np.nan)),
+            "wvf_value": float(latest.get("WVF", np.nan)) if enable_wvf_alert else np.nan,
+            "wvf_upper_band": float(latest.get("WVF_UPPER_BAND", np.nan)) if enable_wvf_alert else np.nan,
+            "wvf_range_high": float(latest.get("WVF_RANGE_HIGH", np.nan)) if enable_wvf_alert else np.nan,
+            "wvf_green_alert": bool(latest.get("WVF_GREEN", False)) if enable_wvf_alert else False,
             "monitor_note": "Rules pending",
         })
 
@@ -890,10 +1234,15 @@ st.caption("Screen on a chosen date, save the selected list, then monitor it dai
 
 with st.sidebar:
     st.header("Input")
+    use_offline_sample_data = st.checkbox(
+        "Use offline sample data (no live API)",
+        value=True,
+        help="Loads bundled sample scan results from data/full_screen_latest.csv and skips live market/fundamental calls.",
+    )
     tickers_text = st.text_area(
         "Custom tickers (optional, comma-separated)",
         value="",
-        help=f"Leave blank to auto-use top {AUTO_UNIVERSE_TOP_N} by average trading volume from S&P 500 constituents.",
+        help=f"Leave blank to auto-use top {AUTO_UNIVERSE_TOP_N} by average trading volume from combined NASDAQ + S&P 500 universe.",
     )
     screen_date = st.date_input("Screen date", value=date.today())
     monitor_date = st.date_input("Monitor date", value=date.today())
@@ -905,23 +1254,51 @@ with st.sidebar:
     fundamentals_file = st.file_uploader("Optional fundamentals snapshot CSV", type=["csv"])
     enable_price_audit = st.checkbox("Enable free price audit (Stooq)", value=False)
     audit_limit = st.number_input("Audit max tickers", min_value=10, max_value=1000, value=100, step=10)
-    enable_live_fundamentals = st.checkbox("Auto-fill fundamentals values (Yahoo free)", value=True)
+    enable_live_fundamentals = st.checkbox("Auto-fill fundamentals values (Yahoo free)", value=False)
     enable_sec_audit = st.checkbox("Enable 2nd fundamentals audit (SEC free)", value=False)
     sec_audit_limit = st.number_input("SEC audit max tickers", min_value=10, max_value=300, value=50, step=10)
 
     st.header("Rule")
     with st.expander("Fundamental", expanded=False):
+        fundamental_mode_label = st.selectbox(
+            "Fundamental setup",
+            ["Gemini match (YoY)", "TradingView setup (QoQ)"],
+            index=0,
+        )
         min_eps_yoy = st.number_input("Min EPS YoY (%)", value=20.0, step=1.0)
         min_revenue_yoy = st.number_input("Min Revenue YoY (%)", value=20.0, step=1.0)
         min_roe_avg = st.number_input("Min 3Y average ROE (%)", value=15.0, step=1.0)
+        roe_stability_max_std = st.number_input("ROE stability max std-dev", value=40.0, step=1.0)
+        min_market_cap_b = st.number_input("Min Market Cap (B USD)", value=10.0, step=1.0)
+        min_fundamental_rules_pass = st.number_input("Min passed fundamental rules (out of 3)", min_value=1, max_value=3, value=2, step=1)
         require_fundamentals = st.checkbox("Require fundamentals for pass", value=True)
 
     with st.expander("Technical-Lazy", expanded=False):
         st.caption("MA checks use: MA50, MA150, MA200")
+        apply_technical_filter = st.checkbox("Apply Technical-Lazy filter in scan", value=False)
         require_close_above_mas = st.checkbox("Require Close > MA50, MA150, MA200", value=True)
         require_ma_stack = st.checkbox("Require MA50 > MA150 > MA200", value=True)
         high_52w_within_pct = st.number_input("Within 52W high (%)", value=25.0, step=1.0)
         low_52w_above_pct = st.number_input("Above 52W low (%)", value=25.0, step=1.0)
+
+    with st.expander("Technical-VIX", expanded=False):
+        st.caption("Separate option: Williams Vix Fix alert on watchlist monitor")
+        enable_wvf_alert = st.checkbox("Enable Williams Vix Fix alert", value=False)
+        wvf_pd = st.number_input("WVF LookBack Period Standard Deviation High", min_value=5, max_value=120, value=22, step=1)
+        wvf_bbl = st.number_input("WVF Bollinger Band Length", min_value=5, max_value=120, value=20, step=1)
+        wvf_mult = st.number_input("WVF Bollinger Band Std Dev Mult", min_value=1.0, max_value=5.0, value=2.0, step=0.1)
+        wvf_lb = st.number_input("WVF Look Back Period Percentile High", min_value=10, max_value=250, value=50, step=1)
+        wvf_ph = st.number_input("WVF Highest Percentile", min_value=0.50, max_value=1.20, value=0.85, step=0.01)
+        wvf_pl = st.number_input("WVF Lowest Percentile", min_value=0.90, max_value=1.50, value=1.01, step=0.01)
+
+wvf_cfg = WVFConfig(
+    lookback_std_high=int(wvf_pd),
+    bollinger_length=int(wvf_bbl),
+    bollinger_mult=float(wvf_mult),
+    lookback_percentile=int(wvf_lb),
+    high_percentile=float(wvf_ph),
+    low_percentile=float(wvf_pl),
+)
 
 as_of_ts = pd.Timestamp(screen_date)
 monitor_ts = pd.Timestamp(monitor_date)
@@ -930,7 +1307,16 @@ manual_tickers = [x.strip().upper() for x in tickers_text.split(",") if x.strip(
 always_include = [x.strip().upper() for x in always_include_text.split(",") if x.strip()]
 universe_note = ""
 universe_preview = pd.DataFrame()
-if manual_tickers:
+if use_offline_sample_data:
+    tickers = []
+    try:
+        sample_df = load_sample_screen_data()
+        preview_cols = [c for c in ["ticker", "company_name", "sector", "business_nature", "pass", "score"] if c in sample_df.columns]
+        universe_preview = sample_df[preview_cols].head(20).copy()
+        universe_note = f"Offline sample mode enabled ({len(sample_df)} sample rows)."
+    except Exception as exc:
+        universe_note = f"Offline sample load failed: {exc}"
+elif manual_tickers:
     tickers = manual_tickers
     universe_note = f"Using custom universe ({len(tickers)} tickers)."
 else:
@@ -943,7 +1329,7 @@ else:
         tickers = apply_always_include(base_tickers, always_include, top_n=AUTO_UNIVERSE_TOP_N)
         actually_forced = [t for t in always_include if t in tickers]
         universe_note = (
-            f"Using auto universe: top {AUTO_UNIVERSE_TOP_N} S&P 500 stocks by average daily trading volume "
+            f"Using auto universe: top {AUTO_UNIVERSE_TOP_N} stocks by average daily trading volume from NASDAQ + S&P 500 "
             "over the latest 60 trading days."
         )
         if actually_forced:
@@ -963,6 +1349,12 @@ cfg = ScreenConfig(
     require_fundamentals=bool(require_fundamentals),
     require_close_above_mas=bool(require_close_above_mas),
     require_ma_stack=bool(require_ma_stack),
+    use_tradingview_setup=(fundamental_mode_label == "TradingView setup (QoQ)"),
+    min_market_cap=float(min_market_cap_b) * 1_000_000_000.0,
+    roe_stability_max_std=float(roe_stability_max_std),
+    fundamental_mode="gemini_yoy" if fundamental_mode_label == "Gemini match (YoY)" else "tradingview_qoq",
+    apply_technical_filter=bool(apply_technical_filter),
+    min_fundamental_rules_pass=int(min_fundamental_rules_pass),
 )
 
 try:
@@ -976,12 +1368,18 @@ tab1, tab2, tab3 = st.tabs(["1. Screen & Save", "2. Monitor Watchlist", "3. Save
 with tab1:
     st.subheader("Screen stocks on selected date")
     st.caption(
-        "Fundamental rule fields: `eps_ge_min_qtrs` / `eps_consec_qtrs`; "
-        "`rev_consec_qtrs` or `annual_revenue_uptrend`; "
-        "`roe_3y_avg_value` with `roe_stable`."
+        "Fundamental rule fields depend on selected setup: "
+        "Gemini match uses YoY EPS/Revenue (latest-quarter momentum + relaxed continuity) + 3Y ROE + market cap; "
+        "TradingView setup uses QoQ EPS/Revenue (latest-quarter momentum + relaxed continuity) + quarterly TTM-style ROE + market cap. "
+        "Market Cap must be above minimum threshold."
     )
+    st.caption("Pass logic: require at least N of 3 fundamental rules (EPS, Revenue, ROE), plus market cap.")
     st.caption("ROE formula: Net Income / Shareholders' Equity")
-    if tickers:
+    if use_offline_sample_data:
+        st.caption(universe_note)
+        if not universe_preview.empty:
+            st.dataframe(universe_preview, use_container_width=True)
+    elif tickers:
         st.caption(universe_note)
         if manual_tickers:
             st.caption(", ".join(tickers[:30]) + (" ..." if len(tickers) > 30 else ""))
@@ -994,7 +1392,13 @@ with tab1:
 
     with left:
         if st.button("Run screen", use_container_width=True):
-            if not tickers:
+            if use_offline_sample_data:
+                try:
+                    st.session_state["screen_df"] = load_sample_screen_data().copy()
+                    st.success("Loaded bundled sample screen results.")
+                except Exception as exc:
+                    st.error(f"Failed to load sample screen data: {exc}")
+            elif not tickers:
                 st.error("No valid universe available. Check network or enter custom tickers.")
             else:
                 with st.spinner("Screening..."):
@@ -1050,6 +1454,7 @@ with tab1:
                         "score",
                         "technical_pass",
                         "fundamental_pass",
+                        "fundamental_rules_hit",
                         "eps_ge_min_qtrs",
                         "eps_consec_qtrs",
                         "rev_ge_min_qtrs",
@@ -1060,6 +1465,9 @@ with tab1:
                         "roe_quality",
                         "eps_yoy_value",
                         "rev_yoy_value",
+                        "revenue_value",
+                        "market_cap_value",
+                        "market_cap_pass",
                         "close",
                         "ret_63d",
                         "audit_close_stooq",
@@ -1082,7 +1490,12 @@ with tab2:
         selected_path = options[selected_name]
 
         if st.button("Run monitor", use_container_width=True):
-            st.session_state["monitor_df"] = monitor_watchlist(load_watchlist(selected_path), monitor_ts)
+            st.session_state["monitor_df"] = monitor_watchlist(
+                load_watchlist(selected_path),
+                monitor_ts,
+                enable_wvf_alert=bool(enable_wvf_alert),
+                wvf_cfg=wvf_cfg,
+            )
             st.session_state["monitor_selected_path"] = selected_path
 
         monitor_df = st.session_state.get("monitor_df")
@@ -1100,6 +1513,15 @@ with tab2:
             c2.metric("SELL", sell_count)
             c3.metric("HOLD", hold_count)
             c4.metric("WATCH", watch_count)
+
+            if bool(enable_wvf_alert):
+                wvf_green_count = int((monitor_df["wvf_green_alert"] == True).sum())
+                st.metric("WVF Green Alerts", wvf_green_count)
+                if wvf_green_count > 0:
+                    green_names = monitor_df.loc[monitor_df["wvf_green_alert"] == True, "ticker"].astype(str).tolist()
+                    st.success(f"WVF alert: green bar detected for {wvf_green_count} ticker(s): {', '.join(green_names)}")
+                else:
+                    st.info("WVF alert: no green bars on monitor date.")
 
             if buy_count > 0:
                 st.warning("Action alert: at least one stock is in BUY zone.")

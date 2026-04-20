@@ -1,32 +1,36 @@
 # US Stock Monitor
 
-Repo-ready starter package for your US stock monitoring project.
+Production-style Streamlit dashboard for US stock screening and watchlist monitoring.
 
-## Structure
+## Repository Structure
 
 ```text
-us-stock-monitor/
-├─ app/
-│  └─ us_stock_monitor_app.py
-├─ backtest/
-│  └─ us_stock_template_backtest.py
-├─ data/
-│  └─ fundamentals_snapshot_template.csv
-├─ README.md
-├─ requirements.txt
-└─ .gitignore
+US Lazy stock/
+  app/
+    us_stock_monitor_app.py
+    saved_watchlists/
+  backtest/
+    us_stock_template_backtest.py
+  data/
+    full_screen_latest.csv
+    fundamentals_snapshot_template.csv
+  docs/
+    SPEC.md
+    ACCEPTANCE.md
+    RISKS.md
+    TODO.md
+    CHANGELOG.md
+    README_us_stock_monitor_app.md
+  README.md
+  requirements.txt
 ```
 
-## Included
-- `app/us_stock_monitor_app.py`
-  - Screen stocks on a chosen date
-  - Save passed watchlists as `US stock dd-MMM-yyyy.csv`
-  - Monitor saved watchlists daily
-  - BUY / SELL / HOLD hooks are placeholders for later rules
-- `backtest/us_stock_template_backtest.py`
-  - Date-based screening and backtest framework
-- `data/fundamentals_snapshot_template.csv`
-  - Sample fundamentals snapshot template
+## Key Features
+- Run stock screening on a selected date.
+- Save passed stocks as `US stock dd-MMM-yyyy.csv`.
+- Monitor saved watchlists daily.
+- Offline sample mode for deterministic, no-network usage.
+- BUY / SELL / HOLD hooks exist for future strategy rules.
 
 ## Install
 
@@ -34,13 +38,29 @@ us-stock-monitor/
 pip install -r requirements.txt
 ```
 
-## Run Streamlit app
+## Run Streamlit App
 
 ```bash
 streamlit run app/us_stock_monitor_app.py
 ```
 
-## Run backtest script
+## Recommended First Run (Offline)
+1. Enable `Use offline sample data (no live API)` in the sidebar (enabled by default).
+2. Click `Run screen`.
+3. Review output and optionally save passed results.
+
+## Optional Live Mode
+- Turn off `Use offline sample data (no live API)`.
+- Provide custom tickers or let the app build an auto-universe from free sources.
+- Optionally upload fundamentals CSV (`data/fundamentals_snapshot_template.csv` as template).
+
+## Validation
+
+```bash
+python -m py_compile app/us_stock_monitor_app.py
+```
+
+## Backtest Script
 
 ```bash
 python backtest/us_stock_template_backtest.py \
@@ -54,5 +74,5 @@ python backtest/us_stock_template_backtest.py \
 ```
 
 ## Notes
-- For strict point-in-time historical fundamentals, you should later replace the sample CSV workflow with a proper SEC filing-based data pipeline.
-- BUY / SELL / HOLD zone rules are intentionally not hardcoded yet.
+- For strict point-in-time fundamentals, replace free-source workflows with filing-grade pipelines.
+- BUY / SELL / HOLD zone logic is currently placeholder-only.

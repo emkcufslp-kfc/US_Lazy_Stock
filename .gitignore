@@ -6,6 +6,9 @@ __pycache__/
 .venv/
 venv/
 env/
+deps/
+.deps/
+.vendor/
 
 # Streamlit
 .streamlit/
@@ -14,6 +17,8 @@ env/
 output/
 saved_watchlists/
 *.log
+streamlit_smoke.out.txt
+streamlit_smoke.err.txt
 
 # OS / editors
 .DS_Store
