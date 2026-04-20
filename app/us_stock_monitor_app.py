@@ -1304,11 +1304,35 @@ def monitor_watchlist(
 
         latest = temp.iloc[-1]
         recent_3 = temp.tail(3)
-        recent_green = (
-            recent_3.get("WVF_GREEN", pd.Series(dtype=bool)).fillna(False).astype(bool)
-            if enable_wvf_alert
-            else pd.Series(dtype=bool)
-        )
+        recent_green = pd.Series(dtype=bool)
+        wvf_last_green_date = pd.NaT
+        wvf_last_green_value = np.nan
+        wvf_last_green_upper_band = np.nan
+        wvf_last_green_range_high = np.nan
+        wvf_last_green_trigger = "N/A"
+        if enable_wvf_alert:
+            recent_green = recent_3.get("WVF_GREEN", pd.Series(dtype=bool)).fillna(False).astype(bool)
+            green_rows = recent_3[recent_green]
+            if not green_rows.empty:
+                last_green = green_rows.iloc[-1]
+                last_green_idx = green_rows.index[-1]
+                last_green_wvf = float(last_green.get("WVF", np.nan))
+                last_green_upper = float(last_green.get("WVF_UPPER_BAND", np.nan))
+                last_green_range_high = float(last_green.get("WVF_RANGE_HIGH", np.nan))
+                cond_upper = pd.notna(last_green_wvf) and pd.notna(last_green_upper) and last_green_wvf >= last_green_upper
+                cond_range = pd.notna(last_green_wvf) and pd.notna(last_green_range_high) and last_green_wvf >= last_green_range_high
+                if cond_upper and cond_range:
+                    wvf_last_green_trigger = "upper_band & range_high"
+                elif cond_upper:
+                    wvf_last_green_trigger = "upper_band"
+                elif cond_range:
+                    wvf_last_green_trigger = "range_high"
+                else:
+                    wvf_last_green_trigger = "green_rule"
+                wvf_last_green_date = pd.Timestamp(last_green_idx)
+                wvf_last_green_value = last_green_wvf
+                wvf_last_green_upper_band = last_green_upper
+                wvf_last_green_range_high = last_green_range_high
         wvf_green_last_3d = bool(recent_green.any()) if enable_wvf_alert else False
         rows.append({
             "ticker": ticker,
@@ -1323,6 +1347,11 @@ def monitor_watchlist(
             "wvf_range_high": float(latest.get("WVF_RANGE_HIGH", np.nan)) if enable_wvf_alert else np.nan,
             "wvf_green_alert": bool(latest.get("WVF_GREEN", False)) if enable_wvf_alert else False,
             "wvf_green_last_3d": wvf_green_last_3d,
+            "wvf_last_green_date": wvf_last_green_date,
+            "wvf_last_green_value": wvf_last_green_value,
+            "wvf_last_green_upper_band": wvf_last_green_upper_band,
+            "wvf_last_green_range_high": wvf_last_green_range_high,
+            "wvf_last_green_trigger": wvf_last_green_trigger,
             "monitor_note": "Rules pending",
         })
 
@@ -1476,6 +1505,7 @@ tab1, tab2, tab3 = st.tabs(["1. Screen & Save", "2. Monitor Watchlist", "3. Save
 
 with tab1:
     st.subheader("Screen stocks on selected date")
+    st.caption("Step 1: choose screen date and select stocks that pass fundamental criteria. Technical-Lazy filter is optional.")
     st.caption(
         "Fundamental rule fields depend on selected setup: "
         "Gemini match uses YoY EPS/Revenue (latest-quarter momentum + relaxed continuity) + 3Y ROE + market cap; "
@@ -1603,6 +1633,7 @@ with tab1:
 
 with tab2:
     st.subheader("Monitor a saved watchlist")
+    st.caption("Step 2: monitor selected stocks daily for the 2nd indicator (Williams VIX Fix).")
     files = list_saved_watchlists()
     uploaded_watchlist = st.file_uploader("Or upload watchlist CSV", type=["csv"], key="monitor_upload")
 
@@ -1668,6 +1699,28 @@ with tab2:
                     f"WVF alert: {wvf_green_last3_count} ticker(s) showed a green signal within the last 3 trading days: "
                     + ", ".join(green_names)
                 )
+                st.markdown("**2nd indicator passed (WVF in last 3 trading days)**")
+                detail_cols = [
+                    "ticker",
+                    "company_name",
+                    "sector",
+                    "business_nature",
+                    "current_price",
+                    "wvf_green_last_3d",
+                    "wvf_last_green_date",
+                    "wvf_last_green_trigger",
+                    "wvf_last_green_value",
+                    "wvf_last_green_upper_band",
+                    "wvf_last_green_range_high",
+                    "wvf_value",
+                    "wvf_upper_band",
+                    "wvf_range_high",
+                ]
+                passed_wvf_df = monitor_df[monitor_df["wvf_green_last_3d"] == True].copy()
+                cols = [c for c in detail_cols if c in passed_wvf_df.columns]
+                if "wvf_last_green_date" in cols:
+                    passed_wvf_df["wvf_last_green_date"] = pd.to_datetime(passed_wvf_df["wvf_last_green_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+                st.dataframe(passed_wvf_df[cols] if cols else passed_wvf_df, use_container_width=True)
             else:
                 st.info("WVF alert: no green bars in the last 3 trading days.")
 
