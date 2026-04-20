@@ -1458,23 +1458,11 @@ elif manual_tickers:
     tickers = manual_tickers
     universe_note = f"Using custom universe ({len(tickers)} tickers)."
 else:
-    try:
-        base_tickers, universe_preview = top_volume_universe(
-            as_of_ts.strftime("%Y-%m-%d"),
-            top_n=AUTO_UNIVERSE_TOP_N,
-            lookback_days=60,
-        )
-        tickers = apply_always_include(base_tickers, always_include, top_n=AUTO_UNIVERSE_TOP_N)
-        actually_forced = [t for t in always_include if t in tickers]
-        universe_note = (
-            f"Using auto universe: top {AUTO_UNIVERSE_TOP_N} stocks by average daily trading volume from NASDAQ + S&P 500 "
-            "over the latest 60 trading days."
-        )
-        if actually_forced:
-            universe_note += f" Forced include: {', '.join(actually_forced)}."
-    except Exception as exc:
-        tickers = []
-        universe_note = f"Auto universe load failed: {exc}"
+    tickers = []
+    universe_note = (
+        f"Auto universe will be loaded when you click Run screen "
+        f"(top {AUTO_UNIVERSE_TOP_N} by average daily trading volume from NASDAQ + S&P 500)."
+    )
 
 profile_map = build_profile_map(tickers) if tickers else {}
 
@@ -1519,6 +1507,8 @@ with tab1:
         st.caption(f"Last screen run date: {last_run_date}")
     if last_run_date and last_run_date != selected_screen_date_str:
         st.warning("Screen date changed. Please click Run screen to refresh results for the newly selected date.")
+    run_universe_note = st.session_state.get("screen_universe_note")
+    run_universe_preview = st.session_state.get("screen_universe_preview")
     if use_offline_sample_data:
         st.caption(universe_note)
         if not universe_preview.empty:
@@ -1530,7 +1520,11 @@ with tab1:
         else:
             st.dataframe(universe_preview.head(20), use_container_width=True)
     else:
-        st.error(universe_note)
+        st.info(universe_note)
+    if run_universe_note and last_run_date == selected_screen_date_str:
+        st.caption(run_universe_note)
+    if isinstance(run_universe_preview, pd.DataFrame) and not run_universe_preview.empty and last_run_date == selected_screen_date_str:
+        st.dataframe(run_universe_preview.head(20), use_container_width=True)
 
     left, right = st.columns(2)
 
@@ -1544,26 +1538,50 @@ with tab1:
                     st.success("Loaded bundled sample screen results.")
                 except Exception as exc:
                     st.error(f"Failed to load sample screen data: {exc}")
-            elif not tickers:
-                st.error("No valid universe available. Check network or enter custom tickers.")
             else:
                 with st.spinner("Screening..."):
+                    tickers_to_run = manual_tickers.copy()
+                    universe_preview_to_show = pd.DataFrame()
+                    run_universe_note = universe_note
+                    if not tickers_to_run:
+                        try:
+                            base_tickers, universe_preview_to_show = top_volume_universe(
+                                as_of_ts.strftime("%Y-%m-%d"),
+                                top_n=AUTO_UNIVERSE_TOP_N,
+                                lookback_days=60,
+                            )
+                            tickers_to_run = apply_always_include(base_tickers, always_include, top_n=AUTO_UNIVERSE_TOP_N)
+                            actually_forced = [t for t in always_include if t in tickers_to_run]
+                            run_universe_note = (
+                                f"Using auto universe: top {AUTO_UNIVERSE_TOP_N} stocks by average daily trading volume from NASDAQ + S&P 500 "
+                                "over the latest 60 trading days."
+                            )
+                            if actually_forced:
+                                run_universe_note += f" Forced include: {', '.join(actually_forced)}."
+                        except Exception as exc:
+                            st.error(f"Auto universe load failed: {exc}")
+                            tickers_to_run = []
+                    if not tickers_to_run:
+                        st.error("No valid universe available. Enter custom tickers or retry auto universe load.")
+                        st.stop()
                     start_download = (as_of_ts - pd.Timedelta(days=500)).strftime("%Y-%m-%d")
                     end_download = (as_of_ts + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
                     st.session_state["screen_df"] = screen_on_date(
-                        tickers=tickers,
+                        tickers=tickers_to_run,
                         as_of_date=as_of_ts,
                         start_download=start_download,
                         end_download=end_download,
                         cfg=cfg,
                         fdf=fdf,
-                        profile_map=profile_map,
+                        profile_map=build_profile_map(tickers_to_run) if tickers_to_run else {},
                         enable_audit=bool(enable_price_audit),
                         audit_limit=int(audit_limit),
                         enable_live_fundamentals=bool(enable_live_fundamentals),
                         enable_sec_audit=bool(enable_sec_audit),
                         sec_audit_limit=int(sec_audit_limit),
                     )
+                    st.session_state["screen_universe_note"] = run_universe_note
+                    st.session_state["screen_universe_preview"] = universe_preview_to_show
                     st.session_state["screen_result_date"] = selected_screen_date_str
                     st.session_state["screen_result_mode"] = "live_scan"
                     st.success("Screen completed.")
