@@ -58,7 +58,7 @@ def download_price_history(tickers: List[str], start: str, end: str) -> Dict[str
         auto_adjust=True,
         progress=False,
         group_by="ticker",
-        threads=True,
+        threads=False,
     )
     data: Dict[str, pd.DataFrame] = {}
 
@@ -804,7 +804,7 @@ def top_volume_universe(as_of_date: str, top_n: int = AUTO_UNIVERSE_TOP_N, lookb
         auto_adjust=False,
         progress=False,
         group_by="ticker",
-        threads=True,
+        threads=False,
     )
     if raw is None or raw.empty:
         raise ValueError("Failed to download volume data for universe selection.")
@@ -1358,12 +1358,700 @@ def monitor_watchlist(
     return watchlist_df.merge(pd.DataFrame(rows), on="ticker", how="left")
 
 
-st.set_page_config(page_title="US Stock Monitor", layout="wide")
-st.title("US Stock Monitor")
-st.caption("Screen on a chosen date, save the selected list, then monitor it daily until buy/sell/hold rules are added.")
+st.set_page_config(
+    page_title="US-STOCK · Terminal",
+    page_icon="▌",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+# --- Custom CSS (Terminal / Bloomberg-inspired) ---
+st.markdown("""
+<style>
+    /* ─────────────  FONTS  ───────────── */
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@200;400;500;700;800&display=swap');
+
+    :root {
+        --bg:           #0A0D12;
+        --bg-elev:      #12161D;
+        --bg-hover:     #1A2028;
+        --bg-panel:     #0E1219;
+        --border:       #1F2936;
+        --border-strong:#2B3542;
+        --text:         #E5E7EB;
+        --text-muted:   #9CA3AF;
+        --text-dim:     #6B7280;
+        --amber:        #FFB800;
+        --amber-dim:    #A37700;
+        --cyan:         #22D3EE;
+        --cyan-dim:     #0E7C8F;
+        --green:        #10B981;
+        --red:          #EF4444;
+        --purple:       #A78BFA;
+        --mono:         'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    /* ─── Global reset ─── */
+    html, body, [class*="css"]  {
+        font-family: var(--mono);
+        font-feature-settings: "tnum", "ss01", "cv11";
+    }
+    .stApp {
+        background:
+            radial-gradient(ellipse 90% 60% at 50% -10%, rgba(255,184,0,0.05) 0%, transparent 60%),
+            radial-gradient(ellipse 70% 50% at 85% 100%, rgba(34,211,238,0.04) 0%, transparent 60%),
+            var(--bg);
+    }
+    /* subtle scanline overlay */
+    .stApp::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image: repeating-linear-gradient(
+            0deg,
+            rgba(255,255,255,0.012) 0px,
+            rgba(255,255,255,0.012) 1px,
+            transparent 1px,
+            transparent 3px
+        );
+        z-index: 9999;
+        mix-blend-mode: overlay;
+    }
+
+    /* Hide Streamlit chrome */
+    #MainMenu { visibility: hidden; }
+    header[data-testid="stHeader"] { background: transparent; }
+    footer { visibility: hidden; }
+
+    /* ─────────────  TERMINAL HEADER BAR  ───────────── */
+    .term-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 14px 18px;
+        margin: 0 0 18px 0;
+        background: linear-gradient(180deg, #0E1219 0%, #0A0D12 100%);
+        border: 1px solid var(--border);
+        border-top: 2px solid var(--amber);
+        border-radius: 2px;
+        position: relative;
+        overflow: hidden;
+    }
+    .term-header::after {
+        content: "";
+        position: absolute;
+        top: 0; left: 0; right: 0;
+        height: 1px;
+        background: linear-gradient(90deg, transparent, var(--amber), transparent);
+        opacity: 0.6;
+        animation: scan 8s linear infinite;
+    }
+    @keyframes scan {
+        0%   { transform: translateX(-100%); }
+        100% { transform: translateX(100%); }
+    }
+    .term-brand {
+        font-family: var(--mono);
+        display: flex;
+        align-items: baseline;
+        gap: 14px;
+    }
+    .term-brand .brand {
+        font-size: 1.35rem;
+        font-weight: 800;
+        color: var(--amber);
+        letter-spacing: 0.08em;
+    }
+    .term-brand .brand .cursor {
+        display: inline-block;
+        width: 0.55em;
+        height: 1em;
+        background: var(--amber);
+        vertical-align: -2px;
+        margin-left: 4px;
+        animation: blink 1.05s step-end infinite;
+    }
+    @keyframes blink { 50% { opacity: 0; } }
+    .term-brand .slash {
+        color: var(--text-dim);
+        font-weight: 400;
+    }
+    .term-brand .tagline {
+        color: var(--text-muted);
+        font-size: 0.78rem;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+    }
+    .term-header-right {
+        display: flex;
+        gap: 14px;
+        align-items: center;
+        font-family: var(--mono);
+        font-size: 0.72rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+    .status-chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 4px 10px;
+        border: 1px solid var(--border-strong);
+        color: var(--text-muted);
+        background: rgba(255,255,255,0.02);
+    }
+    .status-chip .dot {
+        width: 6px; height: 6px; border-radius: 50%;
+        background: var(--green);
+        box-shadow: 0 0 6px currentColor;
+        animation: blink 1.4s ease-in-out infinite;
+    }
+    .status-chip.live { color: var(--green); border-color: rgba(16,185,129,0.4); }
+    .status-chip.hist { color: var(--cyan); border-color: rgba(34,211,238,0.4); }
+    .status-chip.hist .dot { background: var(--cyan); }
+    .status-chip .kv-key { color: var(--text-dim); }
+    .status-chip .kv-val { color: var(--text); font-weight: 500; }
+
+    /* ─────────────  PROCEDURE · WORKFLOW  ───────────── */
+    .procedure {
+        border: 1px solid var(--border);
+        background: var(--bg-panel);
+        padding: 12px 16px;
+        margin-bottom: 14px;
+    }
+    .procedure-head {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 10px;
+        font-family: var(--mono);
+        font-size: 0.72rem;
+    }
+    .procedure-head .pt { color: var(--amber); }
+    .procedure-head .title {
+        color: var(--text);
+        font-weight: 700;
+        letter-spacing: 0.14em;
+    }
+    .procedure-head .hint {
+        color: var(--text-dim);
+        letter-spacing: 0.05em;
+        margin-left: auto;
+    }
+    .procedure-steps {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 8px;
+    }
+    .step {
+        padding: 12px 14px;
+        border: 1px solid var(--border);
+        background: rgba(255,255,255,0.01);
+        font-family: var(--mono);
+        transition: all 0.2s;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        position: relative;
+    }
+    .step .step-num {
+        font-size: 0.66rem;
+        font-weight: 500;
+        color: var(--text-dim);
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+    }
+    .step .step-title {
+        font-size: 0.98rem;
+        font-weight: 700;
+        color: var(--text);
+        letter-spacing: 0.02em;
+    }
+    .step .step-sub {
+        font-size: 0.72rem;
+        color: var(--text-dim);
+        line-height: 1.5;
+        letter-spacing: 0.02em;
+    }
+    .step.done {
+        border-color: rgba(16,185,129,0.35);
+        background: linear-gradient(180deg, rgba(16,185,129,0.05) 0%, transparent 100%);
+    }
+    .step.done .step-num { color: var(--green); }
+    .step.done .step-num::before { content: "✓ "; color: var(--green); }
+    .step.done .step-title { color: var(--text); }
+    .step.active {
+        border-color: var(--amber);
+        background: linear-gradient(180deg, rgba(255,184,0,0.08) 0%, rgba(255,184,0,0.02) 100%);
+        box-shadow: inset 3px 0 0 var(--amber), 0 0 20px rgba(255,184,0,0.08);
+    }
+    .step.active .step-num {
+        color: var(--amber);
+        animation: blink 1.4s ease-in-out infinite;
+    }
+    .step.active .step-num::before { content: "▶ "; color: var(--amber); }
+    .step.active .step-title { color: var(--amber); }
+    .step.pending { opacity: 0.55; }
+    .step.pending .step-title { color: var(--text-muted); }
+
+    /* ─────────────  TICKER RULE STRIP  ───────────── */
+    .ticker-strip {
+        border: 1px solid var(--border);
+        background: var(--bg-panel);
+        padding: 10px 16px;
+        margin-bottom: 18px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 22px;
+        align-items: center;
+        font-family: var(--mono);
+        font-size: 0.78rem;
+        color: var(--text-muted);
+    }
+    .ticker-strip .pt { color: var(--amber); margin-right: 6px; }
+    .ticker-strip .k  { color: var(--text-dim); letter-spacing: 0.08em; text-transform: uppercase; margin-right: 6px; }
+    .ticker-strip .v  { color: var(--text); font-weight: 500; }
+    .ticker-strip .warn{ color: var(--amber); }
+    .ticker-strip .div{ color: var(--border-strong); margin: 0 2px; }
+
+    /* ─────────────  KPI STRIP  ───────────── */
+    .kpi-strip {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        border: 1px solid var(--border);
+        background:
+            linear-gradient(180deg, rgba(255,184,0,0.02) 0%, transparent 100%),
+            var(--bg-panel);
+        margin: 8px 0 18px 0;
+    }
+    .kpi-cell {
+        padding: 18px 20px;
+        border-right: 1px solid var(--border);
+        position: relative;
+    }
+    .kpi-cell:last-child { border-right: none; }
+    .kpi-cell::before {
+        content: "";
+        position: absolute;
+        top: 10px; left: 0;
+        width: 3px; height: 18px;
+        background: var(--amber);
+        opacity: 0;
+        transition: opacity 0.2s;
+    }
+    .kpi-cell:hover::before { opacity: 1; }
+    .kpi-label {
+        font-family: var(--mono);
+        font-size: 0.68rem;
+        font-weight: 500;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--text-dim);
+        margin-bottom: 6px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+    }
+    .kpi-label::before { content: "■"; color: var(--amber); font-size: 0.6rem; }
+    .kpi-value {
+        font-family: var(--mono);
+        font-size: 1.9rem;
+        font-weight: 700;
+        color: var(--text);
+        letter-spacing: -0.01em;
+        line-height: 1;
+        font-variant-numeric: tabular-nums;
+    }
+    .kpi-value .unit {
+        font-size: 0.75rem;
+        color: var(--text-dim);
+        font-weight: 400;
+        margin-left: 4px;
+        letter-spacing: 0.05em;
+    }
+    .kpi-value.amber { color: var(--amber); }
+    .kpi-value.cyan  { color: var(--cyan); }
+    .kpi-sub {
+        margin-top: 4px;
+        font-family: var(--mono);
+        font-size: 0.72rem;
+        color: var(--text-dim);
+    }
+
+    /* ─────────────  RULE PANEL  ───────────── */
+    .rule-box {
+        background: var(--bg-panel);
+        border: 1px solid var(--border);
+        border-left: 2px solid var(--cyan);
+        padding: 14px 18px;
+        margin-bottom: 14px;
+        font-family: var(--mono);
+        font-size: 0.8rem;
+        color: var(--text-muted);
+        line-height: 1.7;
+    }
+    .rule-box .lbl {
+        color: var(--cyan);
+        font-weight: 700;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        font-size: 0.72rem;
+        display: block;
+        margin-bottom: 6px;
+    }
+    .rule-box code, .rule-box b, .rule-box strong {
+        color: var(--text);
+        background: rgba(255,184,0,0.08);
+        padding: 1px 5px;
+        border-radius: 2px;
+    }
+    .rule-box .rule-line { display: flex; gap: 8px; align-items: flex-start; }
+    .rule-box .rule-line .ix { color: var(--amber); min-width: 1.5em; }
+
+    /* ─────────────  SECTION HEADER  ───────────── */
+    .section-header {
+        font-family: var(--mono);
+        font-size: 0.78rem;
+        font-weight: 700;
+        color: var(--text);
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        margin: 26px 0 14px 0;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    .section-header::before { content: ">_"; color: var(--amber); font-weight: 800; }
+    .section-header::after {
+        content: "";
+        flex: 1;
+        height: 1px;
+        background: linear-gradient(90deg, var(--border) 0%, transparent 100%);
+        margin-left: 6px;
+    }
+    .section-header .count {
+        color: var(--text-dim);
+        font-weight: 400;
+        font-size: 0.72rem;
+        letter-spacing: 0.1em;
+    }
+
+    /* ─────────────  SIDEBAR  ───────────── */
+    [data-testid="stSidebar"] {
+        background: var(--bg-panel);
+        border-right: 1px solid var(--border);
+    }
+    [data-testid="stSidebar"] > div { padding-top: 12px; }
+    [data-testid="stSidebar"] h3 {
+        font-family: var(--mono);
+        font-size: 0.75rem !important;
+        font-weight: 700;
+        letter-spacing: 0.2em;
+        text-transform: uppercase;
+        color: var(--amber);
+        margin-bottom: 16px !important;
+    }
+    [data-testid="stSidebar"] label {
+        font-family: var(--mono);
+        font-size: 0.72rem !important;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--text-muted) !important;
+        font-weight: 500 !important;
+    }
+
+    /* ─────────────  WIDGETS  ───────────── */
+    .stButton > button {
+        font-family: var(--mono) !important;
+        font-size: 0.78rem !important;
+        font-weight: 600 !important;
+        letter-spacing: 0.12em !important;
+        text-transform: uppercase !important;
+        border-radius: 2px !important;
+        border: 1px solid var(--border-strong) !important;
+        background: var(--bg-elev) !important;
+        color: var(--text) !important;
+        transition: all 0.15s;
+    }
+    .stButton > button:hover {
+        border-color: var(--amber) !important;
+        color: var(--amber) !important;
+        background: rgba(255,184,0,0.06) !important;
+        box-shadow: 0 0 0 1px var(--amber) inset;
+    }
+    .stButton > button[kind="primary"] {
+        background: var(--amber) !important;
+        color: #0A0D12 !important;
+        border-color: var(--amber) !important;
+    }
+    .stButton > button[kind="primary"]:hover {
+        background: #FFCC33 !important;
+        color: #0A0D12 !important;
+        box-shadow: 0 0 12px rgba(255,184,0,0.4);
+    }
+    .stDownloadButton > button {
+        font-family: var(--mono) !important;
+        font-size: 0.78rem !important;
+        letter-spacing: 0.1em !important;
+        text-transform: uppercase !important;
+        border-radius: 2px !important;
+    }
+    .stTextInput > div > div > input,
+    .stNumberInput > div > div > input,
+    .stDateInput input {
+        font-family: var(--mono) !important;
+        background: var(--bg-elev) !important;
+        border: 1px solid var(--border-strong) !important;
+        border-radius: 2px !important;
+        color: var(--text) !important;
+        font-variant-numeric: tabular-nums;
+    }
+    .stTextInput > div > div > input:focus,
+    .stNumberInput > div > div > input:focus {
+        border-color: var(--amber) !important;
+        box-shadow: 0 0 0 1px var(--amber) !important;
+    }
+    [data-baseweb="select"] > div {
+        background: var(--bg-elev) !important;
+        border: 1px solid var(--border-strong) !important;
+        border-radius: 2px !important;
+        font-family: var(--mono) !important;
+    }
+    .stSlider [data-baseweb="slider"] > div > div { background: var(--border) !important; }
+    .stSlider [role="slider"] {
+        background: var(--amber) !important;
+        box-shadow: 0 0 0 4px rgba(255,184,0,0.15) !important;
+    }
+    [data-testid="stExpander"] {
+        background: var(--bg-panel);
+        border: 1px solid var(--border) !important;
+        border-radius: 2px !important;
+    }
+    [data-testid="stExpander"] summary {
+        font-family: var(--mono);
+        letter-spacing: 0.08em;
+        font-size: 0.8rem;
+        color: var(--text-muted);
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 0;
+        border-bottom: 1px solid var(--border);
+        margin-bottom: 18px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        font-family: var(--mono) !important;
+        font-size: 0.8rem !important;
+        font-weight: 600 !important;
+        letter-spacing: 0.16em !important;
+        text-transform: uppercase !important;
+        color: var(--text-muted) !important;
+        background: transparent !important;
+        border: 1px solid transparent !important;
+        border-bottom: none !important;
+        border-radius: 2px 2px 0 0 !important;
+        padding: 10px 22px !important;
+        margin-right: 2px;
+    }
+    .stTabs [data-baseweb="tab"]:hover {
+        color: var(--text) !important;
+        background: var(--bg-panel) !important;
+    }
+    .stTabs [aria-selected="true"] {
+        color: var(--amber) !important;
+        border-color: var(--border) !important;
+        border-bottom: 1px solid var(--bg) !important;
+        background: var(--bg-panel) !important;
+        position: relative;
+    }
+    .stTabs [aria-selected="true"]::before {
+        content: "";
+        position: absolute;
+        top: -1px; left: 0; right: 0;
+        height: 2px;
+        background: var(--amber);
+    }
+    .stTabs [data-baseweb="tab-highlight"] { display: none; }
+    [data-testid="stDataFrame"] {
+        border: 1px solid var(--border);
+        border-radius: 2px;
+    }
+    [data-testid="stDataFrame"] table {
+        font-family: var(--mono) !important;
+        font-variant-numeric: tabular-nums;
+    }
+    [data-testid="stMetric"] {
+        background: var(--bg-panel);
+        border: 1px solid var(--border);
+        padding: 12px 14px;
+        border-radius: 2px;
+        position: relative;
+    }
+    [data-testid="stMetric"]::before {
+        content: "";
+        position: absolute;
+        top: 0; left: 0;
+        width: 2px; height: 100%;
+        background: var(--amber);
+        opacity: 0.5;
+    }
+    [data-testid="stMetricLabel"] {
+        font-family: var(--mono) !important;
+        font-size: 0.66rem !important;
+        font-weight: 500 !important;
+        letter-spacing: 0.14em !important;
+        text-transform: uppercase !important;
+        color: var(--text-dim) !important;
+    }
+    [data-testid="stMetricValue"] {
+        font-family: var(--mono) !important;
+        font-weight: 700 !important;
+        color: var(--text) !important;
+        font-variant-numeric: tabular-nums;
+    }
+    [data-testid="stAlert"] {
+        font-family: var(--mono);
+        border-radius: 2px !important;
+        border: 1px solid var(--border) !important;
+        font-size: 0.82rem;
+    }
+
+    /* ─────────────  SIGNAL CARD  ───────────── */
+    .sig-card {
+        background: linear-gradient(90deg, rgba(16,185,129,0.08) 0%, var(--bg-panel) 30%);
+        border: 1px solid var(--border);
+        border-left: 3px solid var(--green);
+        padding: 14px 18px;
+        margin-bottom: 10px;
+        font-family: var(--mono);
+        position: relative;
+    }
+    .sig-card::after {
+        content: "● SIGNAL";
+        position: absolute;
+        top: 10px; right: 14px;
+        font-size: 0.65rem;
+        letter-spacing: 0.2em;
+        color: var(--green);
+        animation: blink 1.8s ease-in-out infinite;
+    }
+    .sig-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        margin-bottom: 8px;
+        padding-right: 80px;
+    }
+    .sig-code { font-size: 1.05rem; font-weight: 700; color: var(--text); letter-spacing: 0.05em; }
+    .sig-code .code-num { color: var(--amber); margin-right: 10px; }
+    .sig-sector { font-size: 0.72rem; color: var(--text-dim); letter-spacing: 0.08em; text-transform: uppercase; }
+    .sig-row { font-size: 0.8rem; color: var(--text-muted); margin-top: 4px; }
+    .sig-row .k  { color: var(--text-dim); }
+    .sig-row .v  { color: var(--text); font-weight: 500; }
+    .sig-row .up { color: var(--green); }
+    .sig-row .dn { color: var(--red); }
+    .sig-row .bar-sep { color: var(--border-strong); margin: 0 8px; }
+    .inline-pill {
+        display: inline-block;
+        padding: 2px 10px;
+        font-family: var(--mono);
+        font-size: 0.72rem;
+        border: 1px solid var(--border-strong);
+        color: var(--text-muted);
+        letter-spacing: 0.08em;
+        background: rgba(255,255,255,0.02);
+        margin-right: 6px;
+    }
+    .inline-pill.amber { border-color: rgba(255,184,0,0.4); color: var(--amber); }
+    .wl-banner {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 12px 16px;
+        margin: 12px 0;
+        background: linear-gradient(90deg, rgba(16,185,129,0.08) 0%, transparent 100%);
+        border: 1px solid var(--border);
+        border-left: 2px solid var(--green);
+        font-family: var(--mono);
+        font-size: 0.82rem;
+        color: var(--text);
+    }
+    .wl-banner .tag { color: var(--green); font-weight: 700; letter-spacing: 0.15em; font-size: 0.72rem; }
+    .wl-banner .path { color: var(--amber); font-weight: 500; }
+
+    /* Footer */
+    .term-footer {
+        margin-top: 32px;
+        padding: 14px 0;
+        border-top: 1px solid var(--border);
+        font-family: var(--mono);
+        font-size: 0.7rem;
+        color: var(--text-dim);
+        text-align: center;
+        letter-spacing: 0.1em;
+    }
+    .term-footer .sep { color: var(--border-strong); margin: 0 8px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------------------------
+# KPI helper functions
+# ---------------------------------------------------------------------------
+
+def _render_kpi_cell(label, value, unit="", accent="", sub=""):
+    klass = f"kpi-value {accent}".strip()
+    unit_html = f'<span class="unit">{unit}</span>' if unit else ""
+    sub_html = f'<div class="kpi-sub">{sub}</div>' if sub else ""
+    return (f'<div class="kpi-cell"><div class="kpi-label">{label}</div>'
+            f'<div class="{klass}">{value}{unit_html}</div>{sub_html}</div>')
+
+
+def _render_kpi_strip(cells):
+    return f'<div class="kpi-strip">{"".join(cells)}</div>'
+
+
+# ---------------------------------------------------------------------------
+# Procedure step helper (defined before first use)
+# ---------------------------------------------------------------------------
+
+def _us_step(n: int, title: str, sub: str, active: int) -> str:
+    state = "done" if n < active else ("active" if n == active else "pending")
+    return (
+        f'<div class="step {state}">'
+        f'<div class="step-num">Step {n:02d}</div>'
+        f'<div class="step-title">{title}</div>'
+        f'<div class="step-sub">{sub}</div>'
+        f'</div>'
+    )
+
+
+# ---------------------------------------------------------------------------
+# SIDEBAR — must run first so all cfg variables are available for header/strips
+# ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("Input")
+    st.markdown(
+        '<div class="sb-status">'
+        '<span class="dot" style="background:var(--green);"></span>'
+        '&nbsp;US-STOCK · Control Panel'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    _last_run_sb = st.session_state.get("screen_result_date")
+    _last_mode_sb = st.session_state.get("screen_result_mode", "")
+    if _last_run_sb:
+        _mode_label_sb = "offline" if _last_mode_sb == "offline_sample" else "live"
+        st.markdown(
+            f'<div style="font-size:0.72rem;color:var(--muted);margin-bottom:8px;">'
+            f'Last screen: <span style="color:var(--cyan);">{_last_run_sb}</span>'
+            f'&nbsp;<span class="inline-pill">{_mode_label_sb}</span></div>',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('<hr style="border-color:var(--border);margin:6px 0 10px;">', unsafe_allow_html=True)
+    st.markdown("**▸ Universe & Dates**")
+
     use_offline_sample_data = st.checkbox(
         "Use offline sample data (no live API)",
         value=False,
@@ -1381,6 +2069,10 @@ with st.sidebar:
         value="CLS,JBL",
         help="These tickers are forced into the auto universe even if they are not in the top-volume ranking source.",
     )
+
+    st.markdown('<hr style="border-color:var(--border);margin:10px 0;">', unsafe_allow_html=True)
+    st.markdown("**▸ Data Sources**")
+
     fundamentals_file = st.file_uploader("Optional fundamentals snapshot CSV", type=["csv"])
     enable_price_audit = st.checkbox("Enable free price audit (Stooq)", value=False)
     audit_limit = st.number_input("Audit max tickers", min_value=10, max_value=1000, value=100, step=10)
@@ -1388,8 +2080,10 @@ with st.sidebar:
     enable_sec_audit = st.checkbox("Enable 2nd fundamentals audit (SEC free)", value=False)
     sec_audit_limit = st.number_input("SEC audit max tickers", min_value=10, max_value=300, value=50, step=10)
 
-    st.header("Rule")
-    with st.expander("Fundamental", expanded=False):
+    st.markdown('<hr style="border-color:var(--border);margin:10px 0;">', unsafe_allow_html=True)
+    st.markdown("**▸ Rules**")
+
+    with st.expander("▸ Fundamental", expanded=False):
         fundamental_mode_label = st.selectbox(
             "Fundamental setup",
             ["Gemini match (YoY)", "TradingView setup (QoQ)"],
@@ -1403,7 +2097,7 @@ with st.sidebar:
         min_fundamental_rules_pass = st.number_input("Min passed fundamental rules (out of 3)", min_value=1, max_value=3, value=2, step=1)
         require_fundamentals = st.checkbox("Require fundamentals for pass", value=True)
 
-    with st.expander("Technical-Lazy", expanded=False):
+    with st.expander("▸ Technical-Lazy", expanded=False):
         st.caption("MA checks use: MA50, MA150, MA200")
         apply_technical_filter = st.checkbox("Apply Technical-Lazy filter in scan", value=False)
         require_close_above_mas = st.checkbox("Require Close > MA50, MA150, MA200", value=True)
@@ -1411,7 +2105,7 @@ with st.sidebar:
         high_52w_within_pct = st.number_input("Within 52W high (%)", value=25.0, step=1.0)
         low_52w_above_pct = st.number_input("Above 52W low (%)", value=25.0, step=1.0)
 
-    with st.expander("Technical-VIX", expanded=False):
+    with st.expander("▸ Technical-VIX", expanded=False):
         st.caption("Separate option: Williams Vix Fix alert on watchlist monitor")
         enable_wvf_alert = st.checkbox("Enable Williams Vix Fix alert", value=False)
         wvf_pd = st.number_input("WVF LookBack Period Standard Deviation High", min_value=5, max_value=120, value=22, step=1)
@@ -1420,6 +2114,20 @@ with st.sidebar:
         wvf_lb = st.number_input("WVF Look Back Period Percentile High", min_value=10, max_value=250, value=50, step=1)
         wvf_ph = st.number_input("WVF Highest Percentile", min_value=0.50, max_value=1.20, value=0.85, step=0.01)
         wvf_pl = st.number_input("WVF Lowest Percentile", min_value=0.90, max_value=1.50, value=1.01, step=0.01)
+
+    st.markdown('<hr style="border-color:var(--border);margin:10px 0;">', unsafe_allow_html=True)
+    st.markdown(
+        '<div style="font-size:0.70rem;color:var(--muted);line-height:1.6;">'
+        '<span style="color:var(--amber);">Tip:</span> Run Screen first, then Save passed list, '
+        'then switch to Tab 2 to monitor daily signals.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Build config objects — sidebar must have run before this block
+# ---------------------------------------------------------------------------
 
 wvf_cfg = WVFConfig(
     lookback_std_high=int(wvf_pd),
@@ -1489,24 +2197,138 @@ except Exception as exc:
     st.error(f"Failed to read fundamentals CSV: {exc}")
     fdf = None
 
+
+# ---------------------------------------------------------------------------
+# Dynamic Terminal Header — uses cfg / universe_note resolved above
+# ---------------------------------------------------------------------------
+
+_mode_chip_text = "Offline Sample" if use_offline_sample_data else ("Custom Universe" if manual_tickers else "Auto Universe")
+_univ_size = len(tickers) if tickers else AUTO_UNIVERSE_TOP_N
+_univ_chip_text = f"{_univ_size} tickers" if tickers else f"Top {AUTO_UNIVERSE_TOP_N}"
+_fund_mode_chip = "YoY" if fundamental_mode_label == "Gemini match (YoY)" else "QoQ"
+_tech_chip = "Tech ON" if apply_technical_filter else "Tech OFF"
+
+st.markdown(f"""
+<div class="term-header">
+    <div class="term-brand">
+        <span class="brand">US-STOCK<span class="cursor"></span></span>
+        <span class="slash">//</span>
+        <span class="tagline">US Equity Lazy Monitor · Terminal</span>
+    </div>
+    <div class="term-header-right">
+        <span class="status-chip live">
+            <span class="dot"></span>Live
+        </span>
+        <span class="status-chip">
+            <span class="kv-key">Date</span>
+            <span class="kv-val">{selected_screen_date_str}</span>
+        </span>
+        <span class="status-chip">
+            <span class="kv-key">Universe</span>
+            <span class="kv-val">{_univ_chip_text}</span>
+        </span>
+        <span class="status-chip">
+            <span class="kv-key">Mode</span>
+            <span class="kv-val">{_mode_chip_text} · {_fund_mode_chip} · {_tech_chip}</span>
+        </span>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Procedure strip — dynamic active step
+# ---------------------------------------------------------------------------
+
+_wl_saved = bool(list(WATCHLIST_DIR.glob("US stock*.csv")))
+_screen_done = "screen_df" in st.session_state
+if _screen_done and _wl_saved:
+    _active_step = 3
+elif _screen_done:
+    _active_step = 2
+else:
+    _active_step = 1
+
+_steps_html = (
+    _us_step(1, "Screen",          "Sidebar · set date & rules, then Run Screen", _active_step)
+    + _us_step(2, "Save Watchlist", "Tab 1 · select passed stocks · save CSV",    _active_step)
+    + _us_step(3, "Monitor",        "Tab 2 · load watchlist · run daily monitor", _active_step)
+)
+st.markdown(f"""
+<div class="procedure">
+    <div class="procedure-head">
+        <span class="pt">▸</span>
+        <span class="title">WORKFLOW · PROCEDURE</span>
+        <span class="hint">Follow steps in order · Current: Step {_active_step:02d} / 03</span>
+    </div>
+    <div class="procedure-steps">{_steps_html}</div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Rule strip — uses live cfg values
+# ---------------------------------------------------------------------------
+
+_tech_rule_str = (
+    f"MA50 &gt; MA150 &gt; MA200 · Within {cfg.high_52w_within_pct:.0f}% of 52W High"
+    if apply_technical_filter
+    else "Technical-Lazy filter DISABLED"
+)
+_wvf_warn = '<span class="warn">WVF ON</span>' if enable_wvf_alert else ""
+_eps_label = "EPS YoY" if _fund_mode_chip == "YoY" else "EPS QoQ"
+_rev_label = "Rev YoY" if _fund_mode_chip == "YoY" else "Rev QoQ"
+
+st.markdown(f"""
+<div class="ticker-strip">
+    <span>
+        <span class="pt">▸</span><span class="k">Fundamental</span>
+        <span class="v">{_eps_label} &ge; {cfg.min_eps_yoy:.0f}%</span>
+        <span class="div">│</span>
+        <span class="v">{_rev_label} &ge; {cfg.min_revenue_yoy:.0f}%</span>
+        <span class="div">│</span>
+        <span class="v">3Y ROE &ge; {cfg.min_roe_avg:.0f}%</span>
+        <span class="div">│</span>
+        <span class="v">Mkt Cap &ge; {min_market_cap_b:.0f}B</span>
+        <span class="div">│</span>
+        <span class="v">Pass &ge; {cfg.min_fundamental_rules_pass}/3 rules</span>
+    </span>
+    <span><span class="k">Technical</span><span class="v">{_tech_rule_str}</span>{_wvf_warn}</span>
+    <span><span class="k">Universe</span><span class="v">{_univ_chip_text} · NASDAQ + S&amp;P 500</span></span>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# Tabs
+# ---------------------------------------------------------------------------
+
 tab1, tab2, tab3 = st.tabs(["1. Screen & Save", "2. Monitor Watchlist", "3. Saved Files"])
 
+# ── Tab 1: Screen & Save ────────────────────────────────────────────────────
 with tab1:
-    st.subheader("Screen stocks on selected date")
-    st.caption("Step 1: choose screen date and select stocks that pass fundamental criteria. Technical-Lazy filter is optional.")
-    st.caption(
-        "Fundamental rule fields depend on selected setup: "
-        "Gemini match uses YoY EPS/Revenue (latest-quarter momentum + relaxed continuity) + 3Y ROE + market cap; "
-        "TradingView setup uses QoQ EPS/Revenue (latest-quarter momentum + relaxed continuity) + quarterly TTM-style ROE + market cap. "
-        "Market Cap must be above minimum threshold."
+    st.markdown('<div class="section-header">Screen Stocks on Selected Date</div>', unsafe_allow_html=True)
+
+    # Rule-box instructions
+    _setup_note = (
+        "Gemini match (YoY): uses year-over-year EPS &amp; Revenue + 3-year average ROE + market cap."
+        if fundamental_mode_label == "Gemini match (YoY)"
+        else "TradingView setup (QoQ): uses quarter-over-quarter EPS &amp; Revenue + quarterly TTM-style ROE + market cap."
     )
-    st.caption("Pass logic: require at least N of 3 fundamental rules (EPS, Revenue, ROE), plus market cap.")
-    st.caption("ROE formula: Net Income / Shareholders' Equity")
+    st.markdown(f"""
+<div class="rule-box">
+    <div class="rule-line"><span class="lbl">Step</span> Choose screen date in sidebar, configure rules, then click <strong>Run screen</strong>.</div>
+    <div class="rule-line"><span class="lbl">Setup</span> {_setup_note}</div>
+    <div class="rule-line"><span class="lbl">Pass logic</span> Require at least <span class="ix">{cfg.min_fundamental_rules_pass}</span> of 3 fundamental rules (EPS, Revenue, ROE) <em>plus</em> market cap.</div>
+    <div class="rule-line"><span class="lbl">ROE</span> Net Income / Shareholders' Equity (3-year average).</div>
+    <div class="rule-line"><span class="lbl">Technical</span> {_tech_rule_str} {'— filter active' if apply_technical_filter else '— filter inactive (screen fundamental only)'}.</div>
+</div>
+""", unsafe_allow_html=True)
+
     last_run_date = st.session_state.get("screen_result_date")
-    if last_run_date:
-        st.caption(f"Last screen run date: {last_run_date}")
     if last_run_date and last_run_date != selected_screen_date_str:
         st.warning("Screen date changed. Please click Run screen to refresh results for the newly selected date.")
+
     run_universe_note = st.session_state.get("screen_universe_note")
     run_universe_preview = st.session_state.get("screen_universe_preview")
     if use_offline_sample_data:
@@ -1592,24 +2414,65 @@ with tab1:
             if screen_df is None or screen_df.empty:
                 st.warning("Run the screen first.")
             else:
-                passed = screen_df[screen_df["pass"]].copy()
-                if passed.empty:
+                passed_save = screen_df[screen_df["pass"]].copy()
+                if passed_save.empty:
                     st.warning("No passed stocks to save.")
                 else:
                     result_date_str = st.session_state.get("screen_result_date", selected_screen_date_str)
-                    path = save_watchlist(passed, pd.Timestamp(result_date_str))
-                    st.success(f"Saved: {path.name}")
+                    _save_path = save_watchlist(passed_save, pd.Timestamp(result_date_str))
+                    st.session_state["last_saved_path"] = str(_save_path)
+                    st.session_state["last_saved_count"] = len(passed_save)
+
+    # wl-banner save confirmation
+    _last_saved_path = st.session_state.get("last_saved_path")
+    _last_saved_count = st.session_state.get("last_saved_count")
+    if _last_saved_path:
+        import pathlib as _pl
+        _saved_name = _pl.Path(_last_saved_path).name
+        st.markdown(f"""
+<div class="wl-banner">
+    <span class="tag">SAVED</span>
+    <span class="path">{_saved_name}</span>
+    &nbsp;·&nbsp;
+    <span style="color:var(--cyan);">{_last_saved_count} stocks</span>
+</div>
+""", unsafe_allow_html=True)
+        try:
+            with open(_last_saved_path, "rb") as _f:
+                st.download_button(
+                    label=f"Download {_saved_name}",
+                    data=_f.read(),
+                    file_name=_saved_name,
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+        except Exception:
+            pass
 
     screen_df = st.session_state.get("screen_df")
     if screen_df is not None and not screen_df.empty:
+        # KPI strip after screen
+        _total_screened = len(screen_df)
+        _passed_count = int(screen_df["pass"].sum()) if "pass" in screen_df.columns else 0
+        _pass_rate = f"{(_passed_count / _total_screened * 100):.1f}" if _total_screened else "0.0"
+        _screen_res_date = st.session_state.get("screen_result_date", selected_screen_date_str)
+        _kpi_cells = [
+            _render_kpi_cell("Total Screened", _total_screened, accent="cyan"),
+            _render_kpi_cell("Passed", _passed_count, accent="cyan" if _passed_count > 0 else ""),
+            _render_kpi_cell("Pass Rate", _pass_rate, unit="%", accent="amber" if float(_pass_rate) > 0 else ""),
+            _render_kpi_cell("Screen Date", _screen_res_date),
+        ]
+        st.markdown(_render_kpi_strip(_kpi_cells), unsafe_allow_html=True)
+
         display_df = screen_df.copy()
         for col in display_df.columns:
             if pd.api.types.is_numeric_dtype(display_df[col]):
                 display_df[col] = pd.to_numeric(display_df[col], errors="coerce").round(2)
         display_df = display_df.replace({np.nan: "N/A"})
         st.dataframe(display_df, use_container_width=True)
+
         passed = display_df[display_df["pass"] == True]
-        st.markdown(f"**Passed stocks:** {len(passed)}")
+        st.markdown(f'<div class="section-header">Passed Stocks <span class="count">[ {len(passed)} ]</span></div>', unsafe_allow_html=True)
         if not passed.empty:
             if "close" in passed.columns and "screen_close" not in passed.columns:
                 passed = passed.copy()
@@ -1649,9 +2512,20 @@ with tab1:
     else:
         st.info("No screen result yet.")
 
+
+# ── Tab 2: Monitor Watchlist ────────────────────────────────────────────────
 with tab2:
-    st.subheader("Monitor a saved watchlist")
-    st.caption("Step 2: monitor selected stocks daily for the 2nd indicator (Williams VIX Fix).")
+    st.markdown('<div class="section-header">Monitor a Saved Watchlist</div>', unsafe_allow_html=True)
+
+    st.markdown(f"""
+<div class="rule-box">
+    <div class="rule-line"><span class="lbl">Step</span> Select a saved watchlist (or upload a CSV), set the monitor date in sidebar, then click <strong>Run monitor</strong>.</div>
+    <div class="rule-line"><span class="lbl">WVF</span> Williams Vix Fix is the 2nd indicator — it flags potential price-bottom reversals on watchlist stocks.</div>
+    <div class="rule-line"><span class="lbl">WVF Status</span> {'<span class="ix">ENABLED</span> — green alerts will appear below when triggered.' if enable_wvf_alert else 'DISABLED — enable in sidebar under Technical-VIX.'}</div>
+    <div class="rule-line"><span class="lbl">Actions</span> BUY / SELL / HOLD are placeholder rules — extend <code>buy_zone_rule()</code> / <code>sell_zone_rule()</code> / <code>hold_zone_rule()</code>.</div>
+</div>
+""", unsafe_allow_html=True)
+
     files = list_saved_watchlists()
     uploaded_watchlist = st.file_uploader("Or upload watchlist CSV", type=["csv"], key="monitor_upload")
 
@@ -1661,7 +2535,7 @@ with tab2:
         selected_name = st.selectbox("Select saved watchlist", list(options.keys()))
         selected_path = options[selected_name]
     else:
-        st.info("No saved watchlist files found. Upload a CSV below, or save one from tab 1 first.")
+        st.info("No saved watchlist files found. Upload a CSV below, or save one from Tab 1 first.")
 
     source_label = "none"
     watchlist_df_to_monitor: Optional[pd.DataFrame] = None
@@ -1698,47 +2572,106 @@ with tab2:
         hold_count = int((monitor_df["action"] == "HOLD").sum())
         watch_count = int((monitor_df["action"] == "WATCH").sum())
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("BUY", buy_count)
-        c2.metric("SELL", sell_count)
-        c3.metric("HOLD", hold_count)
-        c4.metric("WATCH", watch_count)
+        # KPI strip for monitor results
+        _mon_kpi_cells = [
+            _render_kpi_cell("BUY", buy_count, accent="cyan" if buy_count > 0 else ""),
+            _render_kpi_cell("SELL", sell_count, accent="amber" if sell_count > 0 else ""),
+            _render_kpi_cell("HOLD", hold_count),
+            _render_kpi_cell("WATCH", watch_count),
+        ]
+        st.markdown(_render_kpi_strip(_mon_kpi_cells), unsafe_allow_html=True)
 
         if bool(enable_wvf_alert):
             wvf_green_today_count = int((monitor_df["wvf_green_alert"] == True).sum())
             wvf_green_last3_count = int((monitor_df.get("wvf_green_last_3d", False) == True).sum())
-            c5, c6 = st.columns(2)
-            c5.metric("WVF Green (Monitor Date)", wvf_green_today_count)
-            c6.metric("WVF Green (Last 3 Trading Days)", wvf_green_last3_count)
+
+            _wvf_kpi_cells = [
+                _render_kpi_cell("WVF Green (Today)", wvf_green_today_count, accent="cyan" if wvf_green_today_count > 0 else ""),
+                _render_kpi_cell("WVF Green (Last 3d)", wvf_green_last3_count, accent="cyan" if wvf_green_last3_count > 0 else ""),
+            ]
+            st.markdown(_render_kpi_strip(_wvf_kpi_cells), unsafe_allow_html=True)
 
             if wvf_green_last3_count > 0:
-                green_names = monitor_df.loc[monitor_df["wvf_green_last_3d"] == True, "ticker"].astype(str).tolist()
-                st.success(
-                    f"WVF alert: {wvf_green_last3_count} ticker(s) showed a green signal within the last 3 trading days: "
-                    + ", ".join(green_names)
-                )
-                st.markdown("**2nd indicator passed (WVF in last 3 trading days)**")
+                green_rows = monitor_df[monitor_df["wvf_green_last_3d"] == True].copy()
+                if "wvf_last_green_date" in green_rows.columns:
+                    green_rows["wvf_last_green_date"] = pd.to_datetime(
+                        green_rows["wvf_last_green_date"], errors="coerce"
+                    ).dt.strftime("%Y-%m-%d")
+
+                st.markdown(f'<div class="section-header">WVF Signals <span class="count">[ {wvf_green_last3_count} ]</span></div>', unsafe_allow_html=True)
+
+                # sig-card for each WVF alert
+                _sig_cards_html = ""
+                for _, row in green_rows.iterrows():
+                    _ticker = str(row.get("ticker", ""))
+                    _company = str(row.get("company_name", ""))
+                    _sector = str(row.get("sector", ""))
+                    _price = row.get("current_price", "N/A")
+                    _price_str = f"${float(_price):.2f}" if _price not in (None, "N/A", "") and str(_price) != "nan" else "N/A"
+                    _wvf_val = row.get("wvf_value", "N/A")
+                    _wvf_ub = row.get("wvf_upper_band", "N/A")
+                    _wvf_rh = row.get("wvf_range_high", "N/A")
+                    _wvf_date = str(row.get("wvf_last_green_date", "N/A"))
+                    _wvf_trig = str(row.get("wvf_last_green_trigger", ""))
+
+                    def _fmt_wvf(v):
+                        try:
+                            return f"{float(v):.4f}"
+                        except Exception:
+                            return str(v)
+
+                    _verdict = (
+                        "Strong bottom candidate — BOTH Bollinger and Percentile signals triggered."
+                        if "BOTH" in _wvf_trig.upper()
+                        else "Bottom signal — Williams Vix Fix green bar detected within the last 3 trading days."
+                    )
+
+                    _sig_cards_html += f"""
+<div class="sig-card" style="--sig-label:'&#9679; SIGNAL'">
+    <div class="sig-head">
+        <span class="sig-code">{_ticker}</span>
+        <span class="sig-sector">{_sector}</span>
+    </div>
+    <div style="font-size:0.78rem;color:var(--muted);margin-bottom:6px;">{_company}</div>
+    <div class="sig-row">
+        <span class="sig-flow">Price</span>
+        <span style="color:var(--cyan);">{_price_str}</span>
+    </div>
+    <div class="sig-row">
+        <span class="sig-flow">WVF Value</span>
+        <span>{_fmt_wvf(_wvf_val)}</span>
+    </div>
+    <div class="sig-row">
+        <span class="sig-flow">Upper Band</span>
+        <span>{_fmt_wvf(_wvf_ub)}</span>
+    </div>
+    <div class="sig-row">
+        <span class="sig-flow">Range High</span>
+        <span>{_fmt_wvf(_wvf_rh)}</span>
+    </div>
+    <div class="sig-row">
+        <span class="sig-flow">Last Green Date</span>
+        <span style="color:var(--amber);">{_wvf_date}</span>
+    </div>
+    <div class="sig-row">
+        <span class="sig-flow">Trigger</span>
+        <span class="inline-pill {'amber' if 'BOTH' in _wvf_trig.upper() else ''}">{_wvf_trig if _wvf_trig else 'N/A'}</span>
+    </div>
+    <div class="sig-verdict">{_verdict}</div>
+</div>
+"""
+                st.markdown(_sig_cards_html, unsafe_allow_html=True)
+
+                # detailed dataframe
                 detail_cols = [
-                    "ticker",
-                    "company_name",
-                    "sector",
-                    "business_nature",
-                    "current_price",
-                    "wvf_green_last_3d",
-                    "wvf_last_green_date",
-                    "wvf_last_green_trigger",
-                    "wvf_last_green_value",
-                    "wvf_last_green_upper_band",
-                    "wvf_last_green_range_high",
-                    "wvf_value",
-                    "wvf_upper_band",
-                    "wvf_range_high",
+                    "ticker", "company_name", "sector", "business_nature",
+                    "current_price", "wvf_green_last_3d",
+                    "wvf_last_green_date", "wvf_last_green_trigger",
+                    "wvf_last_green_value", "wvf_last_green_upper_band", "wvf_last_green_range_high",
+                    "wvf_value", "wvf_upper_band", "wvf_range_high",
                 ]
-                passed_wvf_df = monitor_df[monitor_df["wvf_green_last_3d"] == True].copy()
-                cols = [c for c in detail_cols if c in passed_wvf_df.columns]
-                if "wvf_last_green_date" in cols:
-                    passed_wvf_df["wvf_last_green_date"] = pd.to_datetime(passed_wvf_df["wvf_last_green_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-                st.dataframe(passed_wvf_df[cols] if cols else passed_wvf_df, use_container_width=True)
+                cols = [c for c in detail_cols if c in green_rows.columns]
+                st.dataframe(green_rows[cols] if cols else green_rows, use_container_width=True)
             else:
                 st.info("WVF alert: no green bars in the last 3 trading days.")
 
@@ -1751,34 +2684,48 @@ with tab2:
     else:
         st.info("Select/upload a watchlist, then click Run monitor.")
 
+
+# ── Tab 3: Saved Files ──────────────────────────────────────────────────────
 with tab3:
-    st.subheader("Saved watchlists")
+    st.markdown('<div class="section-header">Saved Watchlists</div>', unsafe_allow_html=True)
     files = list_saved_watchlists()
     if not files:
-        st.info("No saved files.")
+        st.info("No saved files yet. Run the screen in Tab 1 and save a passed list.")
     else:
         rows = []
         for p in files:
             try:
                 df = pd.read_csv(p)
-                rows.append({"file": p.name, "rows": len(df), "path": str(p)})
+                _passed_in_file = int(df["pass"].sum()) if "pass" in df.columns else len(df)
+                rows.append({
+                    "File": p.name,
+                    "Rows": len(df),
+                    "Passed": _passed_in_file,
+                    "Size (KB)": round(p.stat().st_size / 1024, 1),
+                    "Path": str(p),
+                })
             except Exception:
-                rows.append({"file": p.name, "rows": np.nan, "path": str(p)})
-        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+                rows.append({"File": p.name, "Rows": "—", "Passed": "—", "Size (KB)": "—", "Path": str(p)})
+        _files_df = pd.DataFrame(rows)
+        st.dataframe(
+            _files_df[["File", "Rows", "Passed", "Size (KB)"]],
+            use_container_width=True,
+        )
+        st.caption(f"{len(files)} watchlist file(s) found in {WATCHLIST_DIR}")
 
-st.divider()
-st.markdown(
-    """
-**Current behavior**
-- Screens using your fundamental + technical template
-- Saves passed list as `US stock dd-MMM-yyyy.csv`
-- Monitors saved watchlists daily
-- BUY / SELL / HOLD rules are placeholder-only for now
 
-**Later**
-- Once you provide buy/sell/hold zone rules, they can be added to:
-  - `buy_zone_rule()`
-  - `sell_zone_rule()`
-  - `hold_zone_rule()`
-"""
-)
+# ---------------------------------------------------------------------------
+# Terminal footer
+# ---------------------------------------------------------------------------
+
+st.markdown("""
+<div class="term-footer">
+    <span>US-STOCK · Terminal</span>
+    <span class="sep">│</span>
+    <span>Screens using fundamental + technical template</span>
+    <span class="sep">│</span>
+    <span>Saves as <code>US stock dd-MMM-yyyy.csv</code></span>
+    <span class="sep">│</span>
+    <span style="color:var(--amber)">BUY / SELL / HOLD rules: placeholder — add to buy_zone_rule() / sell_zone_rule() / hold_zone_rule()</span>
+</div>
+""", unsafe_allow_html=True)
