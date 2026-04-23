@@ -16,7 +16,10 @@ import yfinance as yf
 
 APP_DIR = Path(__file__).resolve().parent
 WATCHLIST_DIR = APP_DIR / "saved_watchlists"
-WATCHLIST_DIR.mkdir(exist_ok=True, parents=True)
+try:
+    WATCHLIST_DIR.mkdir(exist_ok=True, parents=True)
+except Exception:
+    pass  # read-only filesystem on some cloud hosts
 SAMPLE_SCREEN_PATH = APP_DIR.parent / "data" / "full_screen_latest.csv"
 AUTO_UNIVERSE_TOP_N = 500
 
