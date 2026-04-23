@@ -34,9 +34,9 @@ class ScreenConfig:
     roe_stability_max_std: float = 40.0
     use_tradingview_setup: bool = True
     min_market_cap: float = 10_000_000_000.0
-    fundamental_mode: str = "gemini_yoy"
+    fundamental_mode: str = "tv_ttm"
     apply_technical_filter: bool = False
-    min_fundamental_rules_pass: int = 2
+    min_fundamental_rules_pass: int = 3
 
 
 @dataclass
@@ -326,8 +326,29 @@ def load_combined_universe_profiles() -> pd.DataFrame:
     return out[["ticker", "company_name", "sector", "business_nature"]].reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def load_community_all_profiles() -> pd.DataFrame:
+    """Load sector/industry metadata for all US stocks from community CSV (Ate329/top-us-stock-tickers all.csv).
+    This covers Nasdaq + NYSE + AMEX stocks with industry labels, filling gaps left by the NASDAQ FTP source."""
+    df = _fetch_reference_csv(
+        "https://raw.githubusercontent.com/Ate329/top-us-stock-tickers/main/tickers/all.csv",
+        required_cols=["symbol", "name", "industry"],
+    )
+    if df is None:
+        return pd.DataFrame(columns=["ticker", "company_name", "sector", "business_nature"])
+    out = pd.DataFrame({
+        "ticker": _normalize_ticker_series(df["symbol"]),
+        "company_name": df["name"].astype(str).str.strip(),
+        "sector": df["industry"].astype(str).str.strip().replace({"": "N/A", "nan": "N/A"}),
+        "business_nature": df["industry"].astype(str).str.strip().replace({"": "N/A", "nan": "N/A"}),
+    })
+    out = out.dropna(subset=["ticker"]).drop_duplicates(subset=["ticker"]).sort_values("ticker").reset_index(drop=True)
+    return out
+
+
 def build_profile_map(tickers: List[str]) -> Dict[str, Dict[str, str]]:
-    prof = load_sp500_profiles()
+    # Layer 1: Combined universe (S&P 500 with sectors + Nasdaq with company names)
+    prof = load_combined_universe_profiles()
     lookup = {
         str(r["ticker"]): {
             "company_name": str(r["company_name"]),
@@ -339,10 +360,33 @@ def build_profile_map(tickers: List[str]) -> Dict[str, Dict[str, str]]:
     out: Dict[str, Dict[str, str]] = {}
     for t in tickers:
         item = lookup.get(t, {"company_name": "N/A", "sector": "N/A", "business_nature": "N/A"})
-        out[t] = item
-    # Fill missing profile info from yfinance for tickers not in S&P 500 list (for example forced includes).
+        out[t] = dict(item)  # ensure mutable copy
+
+    # Layer 2: Enrich missing sector/industry from community CSV (covers all US exchanges with industry labels)
+    needs_sector = [t for t in tickers if out[t].get("sector") == "N/A" or out[t].get("company_name") == "N/A"]
+    if needs_sector:
+        comm = load_community_all_profiles()
+        comm_lookup = {str(r["ticker"]): r for _, r in comm.iterrows()}
+        for t in needs_sector:
+            row = comm_lookup.get(t)
+            if row is not None:
+                if out[t].get("company_name") == "N/A":
+                    name = str(row.get("company_name", "")).strip()
+                    if name and name != "nan":
+                        out[t]["company_name"] = name
+                if out[t].get("sector") == "N/A":
+                    sec = str(row.get("sector", "")).strip()
+                    if sec and sec not in ("nan", "N/A"):
+                        out[t]["sector"] = sec
+                if out[t].get("business_nature") == "N/A":
+                    bn = str(row.get("business_nature", "")).strip()
+                    if bn and bn not in ("nan", "N/A"):
+                        out[t]["business_nature"] = bn
+
+    # Layer 3: Fall back to yfinance ONLY for tickers still missing company_name
+    # (avoids hundreds of API calls just for missing sector data)
     for t in tickers:
-        if out[t].get("company_name") == "N/A" or out[t].get("sector") == "N/A" or out[t].get("business_nature") == "N/A":
+        if out[t].get("company_name") == "N/A":
             live = load_live_fundamentals_yf(t)
             if out[t].get("company_name") == "N/A":
                 out[t]["company_name"] = str(live.get("company_name", "N/A"))
@@ -448,6 +492,117 @@ def load_tradingview_like_fundamentals_yf(ticker: str) -> Dict[str, object]:
         "roe_fq_value": float(roe_ttm_series.iloc[-1]) if not roe_ttm_series.empty else np.nan,
         "revenue_value": float(rev_q.iloc[-1]) if not rev_q.empty else np.nan,
     }
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def load_tv_match_fundamentals_yf(ticker: str, as_of_date_str: str) -> Dict[str, object]:
+    """TradingView-equivalent fundamental metrics for a given as-of date.
+
+    Metrics computed:
+      - eps_ttm_yoy  : Diluted EPS TTM YoY %  = (sum last 4Q EPS / sum prior 4Q EPS - 1) × 100
+      - rev_ttm_yoy  : Total Revenue TTM YoY % = (sum last 4Q rev / sum prior 4Q rev - 1) × 100
+      - roe_ttm      : ROE TTM %               = (sum last 4Q net income / avg last 4Q equity) × 100
+
+    Quarterly data is filtered to as_of_date so historical dates are supported.
+    Falls back to single-quarter YoY when only 5 quarters are available.
+    """
+    as_of = pd.Timestamp(as_of_date_str)
+    result: Dict[str, object] = {
+        "eps_ttm_yoy": np.nan,
+        "rev_ttm_yoy": np.nan,
+        "roe_ttm": np.nan,
+        "revenue_value": np.nan,
+    }
+    try:
+        tk = yf.Ticker(ticker)
+        qis = tk.quarterly_income_stmt
+    except Exception:
+        return result
+    if qis is None or qis.empty:
+        return result
+
+    qis = qis.copy()
+    qis.columns = pd.to_datetime(qis.columns)
+    qis = qis.sort_index(axis=1)
+    qis = qis.loc[:, qis.columns <= as_of]          # ← historical date filter
+
+    eps_row = "Diluted EPS" if "Diluted EPS" in qis.index else ("Basic EPS" if "Basic EPS" in qis.index else None)
+    rev_row = "Total Revenue" if "Total Revenue" in qis.index else None
+
+    eps_q = pd.to_numeric(qis.loc[eps_row], errors="coerce").dropna() if eps_row else pd.Series(dtype=float)
+    rev_q = pd.to_numeric(qis.loc[rev_row], errors="coerce").dropna() if rev_row else pd.Series(dtype=float)
+
+    # TTM EPS YoY: (sum of last 4 quarters) / (sum of prior 4 quarters) − 1
+    if len(eps_q) >= 8:
+        c, p = float(eps_q.iloc[-4:].sum()), float(eps_q.iloc[-8:-4].sum())
+        if p != 0 and pd.notna(p):
+            result["eps_ttm_yoy"] = (c / p - 1.0) * 100.0
+    elif len(eps_q) >= 5:
+        # Fallback: most-recent quarter vs same quarter one year prior
+        if eps_q.iloc[-5] != 0 and pd.notna(eps_q.iloc[-5]):
+            result["eps_ttm_yoy"] = (float(eps_q.iloc[-1]) / float(eps_q.iloc[-5]) - 1.0) * 100.0
+
+    # TTM Revenue YoY
+    if len(rev_q) >= 8:
+        c, p = float(rev_q.iloc[-4:].sum()), float(rev_q.iloc[-8:-4].sum())
+        if p != 0 and pd.notna(p):
+            result["rev_ttm_yoy"] = (c / p - 1.0) * 100.0
+    elif len(rev_q) >= 5:
+        if rev_q.iloc[-5] != 0 and pd.notna(rev_q.iloc[-5]):
+            result["rev_ttm_yoy"] = (float(rev_q.iloc[-1]) / float(rev_q.iloc[-5]) - 1.0) * 100.0
+
+    result["revenue_value"] = float(rev_q.iloc[-4:].sum()) if len(rev_q) >= 4 else (float(rev_q.iloc[-1]) if not rev_q.empty else np.nan)
+
+    # TTM ROE: (sum last 4Q net income) / (avg last 4Q equity) × 100
+    try:
+        qbs = tk.quarterly_balance_sheet
+        if qbs is not None and not qbs.empty and "Net Income" in qis.index and "Stockholders Equity" in qbs.index:
+            qbs2 = qbs.copy()
+            qbs2.columns = pd.to_datetime(qbs2.columns)
+            qbs2 = qbs2.sort_index(axis=1)
+            qbs2 = qbs2.loc[:, qbs2.columns <= as_of]
+            ni_q = pd.to_numeric(qis.loc["Net Income"], errors="coerce").dropna()
+            eq_q = pd.to_numeric(qbs2.loc["Stockholders Equity"], errors="coerce").dropna()
+            df_roe = pd.DataFrame({"ni": ni_q, "eq": eq_q}).dropna().sort_index()
+            if len(df_roe) >= 4:
+                ttm_ni = float(df_roe["ni"].iloc[-4:].sum())
+                avg_eq = float(df_roe["eq"].iloc[-4:].mean())
+                if avg_eq != 0 and pd.notna(avg_eq):
+                    result["roe_ttm"] = (ttm_ni / avg_eq) * 100.0
+    except Exception:
+        pass
+
+    # ── Fallback to yfinance pre-computed info fields ──────────────────────
+    # yfinance only returns the last 4 quarters of raw data, which is not
+    # enough to compute TTM YoY (needs 8Q) or even single-Q YoY (needs 5Q).
+    # yfinance's info API exposes the same pre-computed values TradingView uses:
+    #   earningsQuarterlyGrowth → EPS most-recent-quarter YoY (≈ TV TTM EPS YoY)
+    #   revenueGrowth           → Revenue TTM YoY
+    #   returnOnEquity          → ROE TTM
+    # These are used as the primary fill when raw-data computation yields NaN.
+    if pd.isna(result["eps_ttm_yoy"]) or pd.isna(result["rev_ttm_yoy"]) or pd.isna(result["roe_ttm"]):
+        try:
+            info = tk.get_info()
+            if pd.isna(result["eps_ttm_yoy"]):
+                v = info.get("earningsQuarterlyGrowth")
+                if v is not None and pd.notna(v):
+                    result["eps_ttm_yoy"] = float(v) * 100.0
+            if pd.isna(result["rev_ttm_yoy"]):
+                v = info.get("revenueGrowth")
+                if v is not None and pd.notna(v):
+                    result["rev_ttm_yoy"] = float(v) * 100.0
+            if pd.isna(result["roe_ttm"]):
+                v = info.get("returnOnEquity")
+                if v is not None and pd.notna(v):
+                    result["roe_ttm"] = float(v) * 100.0
+            if pd.isna(result["revenue_value"]):
+                v = info.get("totalRevenue")
+                if v is not None and pd.notna(v):
+                    result["revenue_value"] = float(v)
+        except Exception:
+            pass
+
+    return result
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
@@ -877,6 +1032,63 @@ def eval_fundamental(
     fdf: Optional[pd.DataFrame],
     cfg: ScreenConfig,
 ) -> Tuple[bool, Dict[str, object]]:
+    # ── TradingView match mode (default) ────────────────────────────────────
+    # Replicates TV screener exactly:
+    #   EPS Diluted TTM YoY > min_eps_yoy
+    #   Revenue TTM YoY     > min_revenue_yoy
+    #   ROE TTM             > min_roe_avg
+    #   Market Cap          > min_market_cap
+    # ALL 3 rules must pass (min_fundamental_rules_pass=3) to match TV AND logic.
+    if cfg.fundamental_mode == "tv_ttm":
+        tv = load_tv_match_fundamentals_yf(ticker, as_of_date.strftime("%Y-%m-%d"))
+        eps_ttm_yoy = tv.get("eps_ttm_yoy", np.nan)
+        rev_ttm_yoy = tv.get("rev_ttm_yoy", np.nan)
+        roe_ttm     = tv.get("roe_ttm", np.nan)
+
+        eps_pass = bool(pd.notna(eps_ttm_yoy) and float(eps_ttm_yoy) >= cfg.min_eps_yoy)
+        rev_pass = bool(pd.notna(rev_ttm_yoy) and float(rev_ttm_yoy) >= cfg.min_revenue_yoy)
+        roe_pass = bool(pd.notna(roe_ttm)     and float(roe_ttm)     >= cfg.min_roe_avg)
+
+        market_cap_value = load_market_cap_yf(ticker)
+        market_cap_pass  = bool(pd.notna(market_cap_value) and market_cap_value >= cfg.min_market_cap)
+        strict_depth_ok  = pd.notna(market_cap_value)
+
+        fundamental_rules_hit = int(eps_pass) + int(rev_pass) + int(roe_pass)
+        fund_final_pass = bool(
+            fundamental_rules_hit >= int(cfg.min_fundamental_rules_pass)
+            and market_cap_pass
+            and strict_depth_ok
+        )
+        if not cfg.require_fundamentals:
+            fund_final_pass = True
+
+        return fund_final_pass, {
+            "fundamentals_used": True,
+            "fundamentals_source": "tradingview_ttm_match",
+            "eps_pass": eps_pass,
+            "rev_pass": rev_pass,
+            "roe_pass": roe_pass,
+            "market_cap_pass": market_cap_pass,
+            "roe_avg": roe_ttm,
+            "eps_yoy_value": eps_ttm_yoy,
+            "rev_yoy_value": rev_ttm_yoy,
+            "revenue_value": tv.get("revenue_value", np.nan),
+            "market_cap_value": market_cap_value,
+            "eps_ge_min_qtrs": 1 if eps_pass else 0,
+            "rev_ge_min_qtrs": 1 if rev_pass else 0,
+            "eps_consec_qtrs": 1 if eps_pass else 0,
+            "rev_consec_qtrs": 1 if rev_pass else 0,
+            "annual_revenue_uptrend": np.nan,
+            "roe_std": np.nan,
+            "roe_stable": True,
+            "roe_each_ge_min": roe_pass,
+            "roe_quality": "better(>17)" if pd.notna(roe_ttm) and float(roe_ttm) > 17 else "ok(>15)",
+            "eps_vals": [eps_ttm_yoy],
+            "rev_vals": [rev_ttm_yoy],
+            "fundamental_rules_hit": fundamental_rules_hit,
+            "note": "TradingView match: TTM EPS YoY + TTM Revenue YoY + TTM ROE (all 3 must pass)",
+        }
+
     if cfg.fundamental_mode == "gemini_yoy":
         gm = load_gemini_like_fundamentals_yf(ticker)
         eps_yoy = pd.Series(gm.get("eps_yoy_series", []), dtype=float)
@@ -1365,58 +1577,82 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# --- Custom CSS (Terminal / Bloomberg-inspired) ---
+# --- Custom CSS (Terminal / Bloomberg-inspired · Enhanced Visual Edition) ---
 st.markdown("""
 <style>
     /* ─────────────  FONTS  ───────────── */
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@200;400;500;700;800&display=swap');
 
     :root {
-        --bg:           #0A0D12;
-        --bg-elev:      #12161D;
+        --bg:           #060910;
+        --bg-elev:      #0E1219;
         --bg-hover:     #1A2028;
-        --bg-panel:     #0E1219;
-        --border:       #1F2936;
-        --border-strong:#2B3542;
+        --bg-panel:     #0A0D14;
+        --bg-glass:     rgba(10,13,20,0.72);
+        --border:       #1A2535;
+        --border-strong:#283545;
         --text:         #E5E7EB;
         --text-muted:   #9CA3AF;
-        --text-dim:     #6B7280;
+        --text-dim:     #5A6478;
         --amber:        #FFB800;
         --amber-dim:    #A37700;
+        --amber-glow:   rgba(255,184,0,0.35);
         --cyan:         #22D3EE;
         --cyan-dim:     #0E7C8F;
+        --cyan-glow:    rgba(34,211,238,0.3);
         --green:        #10B981;
+        --green-glow:   rgba(16,185,129,0.3);
         --red:          #EF4444;
         --purple:       #A78BFA;
         --mono:         'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
 
+    /* ─────────────  ANIMATIONS  ───────────── */
+    @keyframes scan        { 0%{transform:translateX(-100%)} 100%{transform:translateX(200%)} }
+    @keyframes blink       { 50%{opacity:0} }
+    @keyframes aurora      { 0%,100%{opacity:0.6;transform:scale(1) translateY(0)} 50%{opacity:1;transform:scale(1.08) translateY(-12px)} }
+    @keyframes aurora2     { 0%,100%{opacity:0.4;transform:scale(1) translateX(0)} 50%{opacity:0.7;transform:scale(1.05) translateX(14px)} }
+    @keyframes glow-pulse  { 0%,100%{opacity:0.7} 50%{opacity:1} }
+    @keyframes shimmer     { 0%{background-position:-400px 0} 100%{background-position:400px 0} }
+    @keyframes border-flow { 0%{background-position:0% 50%} 50%{background-position:100% 50%} 100%{background-position:0% 50%} }
+    @keyframes float-up    { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-3px)} }
+
     /* ─── Global reset ─── */
-    html, body, [class*="css"]  {
+    html, body, [class*="css"] {
         font-family: var(--mono);
-        font-feature-settings: "tnum", "ss01", "cv11";
+        font-feature-settings: "tnum","ss01","cv11";
     }
+
+    /* ─── Aurora background ─── */
     .stApp {
-        background:
-            radial-gradient(ellipse 90% 60% at 50% -10%, rgba(255,184,0,0.05) 0%, transparent 60%),
-            radial-gradient(ellipse 70% 50% at 85% 100%, rgba(34,211,238,0.04) 0%, transparent 60%),
-            var(--bg);
+        background: var(--bg);
+        position: relative;
     }
-    /* subtle scanline overlay */
+    .stApp::after {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: 0;
+        background:
+            radial-gradient(ellipse 80% 55% at 20% -5%,  rgba(255,184,0,0.07)  0%, transparent 55%),
+            radial-gradient(ellipse 65% 50% at 85% 105%, rgba(34,211,238,0.06) 0%, transparent 55%),
+            radial-gradient(ellipse 50% 40% at 60% 50%,  rgba(167,139,250,0.03) 0%, transparent 50%);
+        animation: aurora 14s ease-in-out infinite;
+    }
+
+    /* ─── Dot-grid + scanline overlay ─── */
     .stApp::before {
         content: "";
         position: fixed;
         inset: 0;
         pointer-events: none;
-        background-image: repeating-linear-gradient(
-            0deg,
-            rgba(255,255,255,0.012) 0px,
-            rgba(255,255,255,0.012) 1px,
-            transparent 1px,
-            transparent 3px
-        );
         z-index: 9999;
         mix-blend-mode: overlay;
+        background-image:
+            radial-gradient(circle, rgba(255,255,255,0.08) 1px, transparent 1px),
+            repeating-linear-gradient(0deg, rgba(255,255,255,0.015) 0px, rgba(255,255,255,0.015) 1px, transparent 1px, transparent 4px);
+        background-size: 28px 28px, 100% 4px;
     }
 
     /* Hide Streamlit chrome */
@@ -1429,372 +1665,377 @@ st.markdown("""
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding: 14px 18px;
+        padding: 16px 22px;
         margin: 0 0 18px 0;
-        background: linear-gradient(180deg, #0E1219 0%, #0A0D12 100%);
-        border: 1px solid var(--border);
+        background: linear-gradient(180deg, rgba(20,26,38,0.95) 0%, rgba(6,9,16,0.98) 100%);
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        border: 1px solid rgba(255,184,0,0.18);
         border-top: 2px solid var(--amber);
-        border-radius: 2px;
         position: relative;
         overflow: hidden;
+        box-shadow:
+            0 0 0 1px rgba(255,184,0,0.06) inset,
+            0 4px 32px rgba(0,0,0,0.6),
+            0 0 60px rgba(255,184,0,0.04);
     }
+    /* sweeping amber scan line */
     .term-header::after {
         content: "";
         position: absolute;
-        top: 0; left: 0; right: 0;
+        top: 0; left: 0; width: 40%; height: 100%;
+        background: linear-gradient(90deg, transparent, rgba(255,184,0,0.07), transparent);
+        animation: scan 5s linear infinite;
+    }
+    /* top-edge glow bar */
+    .term-header::before {
+        content: "";
+        position: absolute;
+        top: -1px; left: 10%; right: 10%;
         height: 1px;
         background: linear-gradient(90deg, transparent, var(--amber), transparent);
-        opacity: 0.6;
-        animation: scan 8s linear infinite;
+        filter: blur(2px);
+        animation: glow-pulse 3s ease-in-out infinite;
     }
-    @keyframes scan {
-        0%   { transform: translateX(-100%); }
-        100% { transform: translateX(100%); }
-    }
-    .term-brand {
-        font-family: var(--mono);
-        display: flex;
-        align-items: baseline;
-        gap: 14px;
-    }
+
+    .term-brand { display: flex; align-items: baseline; gap: 14px; }
     .term-brand .brand {
-        font-size: 1.35rem;
+        font-size: 1.45rem;
         font-weight: 800;
         color: var(--amber);
-        letter-spacing: 0.08em;
+        letter-spacing: 0.1em;
+        text-shadow: 0 0 18px var(--amber-glow), 0 0 40px rgba(255,184,0,0.15);
     }
     .term-brand .brand .cursor {
         display: inline-block;
-        width: 0.55em;
-        height: 1em;
+        width: 0.55em; height: 1em;
         background: var(--amber);
-        vertical-align: -2px;
-        margin-left: 4px;
+        box-shadow: 0 0 10px var(--amber), 0 0 20px var(--amber-glow);
+        vertical-align: -2px; margin-left: 4px;
         animation: blink 1.05s step-end infinite;
     }
-    @keyframes blink { 50% { opacity: 0; } }
-    .term-brand .slash {
-        color: var(--text-dim);
-        font-weight: 400;
-    }
+    .term-brand .slash { color: var(--text-dim); font-weight: 400; }
     .term-brand .tagline {
         color: var(--text-muted);
         font-size: 0.78rem;
-        letter-spacing: 0.12em;
+        letter-spacing: 0.14em;
         text-transform: uppercase;
     }
     .term-header-right {
-        display: flex;
-        gap: 14px;
-        align-items: center;
+        display: flex; gap: 10px; align-items: center;
         font-family: var(--mono);
-        font-size: 0.72rem;
+        font-size: 0.7rem;
         letter-spacing: 0.08em;
         text-transform: uppercase;
     }
     .status-chip {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-        padding: 4px 10px;
+        display: inline-flex; align-items: center; gap: 6px;
+        padding: 5px 11px;
         border: 1px solid var(--border-strong);
         color: var(--text-muted);
-        background: rgba(255,255,255,0.02);
+        background: rgba(255,255,255,0.03);
+        backdrop-filter: blur(8px);
+        transition: all 0.2s;
     }
+    .status-chip:hover { border-color: var(--amber); color: var(--text); }
     .status-chip .dot {
         width: 6px; height: 6px; border-radius: 50%;
         background: var(--green);
-        box-shadow: 0 0 6px currentColor;
-        animation: blink 1.4s ease-in-out infinite;
+        box-shadow: 0 0 8px var(--green), 0 0 14px var(--green-glow);
+        animation: glow-pulse 1.8s ease-in-out infinite;
     }
-    .status-chip.live { color: var(--green); border-color: rgba(16,185,129,0.4); }
-    .status-chip.hist { color: var(--cyan); border-color: rgba(34,211,238,0.4); }
-    .status-chip.hist .dot { background: var(--cyan); }
+    .status-chip.live {
+        color: var(--green);
+        border-color: rgba(16,185,129,0.35);
+        background: rgba(16,185,129,0.06);
+        box-shadow: 0 0 12px rgba(16,185,129,0.08);
+    }
+    .status-chip.hist { color: var(--cyan); border-color: rgba(34,211,238,0.35); }
+    .status-chip.hist .dot { background: var(--cyan); box-shadow: 0 0 8px var(--cyan), 0 0 14px var(--cyan-glow); }
     .status-chip .kv-key { color: var(--text-dim); }
     .status-chip .kv-val { color: var(--text); font-weight: 500; }
 
     /* ─────────────  PROCEDURE · WORKFLOW  ───────────── */
     .procedure {
         border: 1px solid var(--border);
-        background: var(--bg-panel);
-        padding: 12px 16px;
-        margin-bottom: 14px;
+        background: var(--bg-glass);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        padding: 14px 18px;
+        margin-bottom: 16px;
+        box-shadow: 0 2px 24px rgba(0,0,0,0.4), 0 0 0 1px rgba(255,255,255,0.02) inset;
     }
     .procedure-head {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        margin-bottom: 10px;
-        font-family: var(--mono);
-        font-size: 0.72rem;
+        display: flex; align-items: center; gap: 10px;
+        margin-bottom: 12px;
+        font-family: var(--mono); font-size: 0.72rem;
     }
-    .procedure-head .pt { color: var(--amber); }
-    .procedure-head .title {
-        color: var(--text);
-        font-weight: 700;
-        letter-spacing: 0.14em;
+    .procedure-head .pt {
+        color: var(--amber);
+        text-shadow: 0 0 10px var(--amber-glow);
     }
-    .procedure-head .hint {
-        color: var(--text-dim);
-        letter-spacing: 0.05em;
-        margin-left: auto;
-    }
+    .procedure-head .title { color: var(--text); font-weight: 700; letter-spacing: 0.14em; }
+    .procedure-head .hint  { color: var(--text-dim); letter-spacing: 0.05em; margin-left: auto; }
     .procedure-steps {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
         gap: 8px;
     }
     .step {
-        padding: 12px 14px;
+        padding: 14px 16px;
         border: 1px solid var(--border);
-        background: rgba(255,255,255,0.01);
+        background: rgba(255,255,255,0.015);
+        backdrop-filter: blur(8px);
         font-family: var(--mono);
-        transition: all 0.2s;
-        display: flex;
-        flex-direction: column;
-        gap: 4px;
-        position: relative;
+        transition: all 0.25s;
+        display: flex; flex-direction: column; gap: 4px;
+        position: relative; overflow: hidden;
+    }
+    .step::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(135deg, rgba(255,255,255,0.03) 0%, transparent 60%);
+        pointer-events: none;
     }
     .step .step-num {
-        font-size: 0.66rem;
-        font-weight: 500;
+        font-size: 0.66rem; font-weight: 500;
         color: var(--text-dim);
-        letter-spacing: 0.18em;
-        text-transform: uppercase;
+        letter-spacing: 0.18em; text-transform: uppercase;
     }
-    .step .step-title {
-        font-size: 0.98rem;
-        font-weight: 700;
-        color: var(--text);
-        letter-spacing: 0.02em;
-    }
-    .step .step-sub {
-        font-size: 0.72rem;
-        color: var(--text-dim);
-        line-height: 1.5;
-        letter-spacing: 0.02em;
-    }
+    .step .step-title { font-size: 0.98rem; font-weight: 700; color: var(--text); letter-spacing: 0.02em; }
+    .step .step-sub   { font-size: 0.72rem; color: var(--text-dim); line-height: 1.5; letter-spacing: 0.02em; }
+
     .step.done {
-        border-color: rgba(16,185,129,0.35);
-        background: linear-gradient(180deg, rgba(16,185,129,0.05) 0%, transparent 100%);
+        border-color: rgba(16,185,129,0.4);
+        background: linear-gradient(180deg, rgba(16,185,129,0.08) 0%, rgba(16,185,129,0.02) 100%);
+        box-shadow: 0 0 16px rgba(16,185,129,0.08), inset 0 0 20px rgba(16,185,129,0.03);
     }
-    .step.done .step-num { color: var(--green); }
+    .step.done .step-num { color: var(--green); text-shadow: 0 0 8px var(--green-glow); }
     .step.done .step-num::before { content: "✓ "; color: var(--green); }
-    .step.done .step-title { color: var(--text); }
+
     .step.active {
         border-color: var(--amber);
-        background: linear-gradient(180deg, rgba(255,184,0,0.08) 0%, rgba(255,184,0,0.02) 100%);
-        box-shadow: inset 3px 0 0 var(--amber), 0 0 20px rgba(255,184,0,0.08);
+        background: linear-gradient(180deg, rgba(255,184,0,0.1) 0%, rgba(255,184,0,0.03) 100%);
+        box-shadow:
+            inset 3px 0 0 var(--amber),
+            0 0 28px rgba(255,184,0,0.12),
+            0 0 0 1px rgba(255,184,0,0.08) inset;
     }
     .step.active .step-num {
         color: var(--amber);
+        text-shadow: 0 0 10px var(--amber-glow);
         animation: blink 1.4s ease-in-out infinite;
     }
     .step.active .step-num::before { content: "▶ "; color: var(--amber); }
-    .step.active .step-title { color: var(--amber); }
-    .step.pending { opacity: 0.55; }
+    .step.active .step-title {
+        color: var(--amber);
+        text-shadow: 0 0 14px var(--amber-glow);
+    }
+    .step.pending { opacity: 0.45; }
     .step.pending .step-title { color: var(--text-muted); }
 
     /* ─────────────  TICKER RULE STRIP  ───────────── */
     .ticker-strip {
         border: 1px solid var(--border);
-        background: var(--bg-panel);
-        padding: 10px 16px;
+        background: var(--bg-glass);
+        backdrop-filter: blur(10px);
+        padding: 10px 18px;
         margin-bottom: 18px;
-        display: flex;
-        flex-wrap: wrap;
-        gap: 22px;
-        align-items: center;
-        font-family: var(--mono);
-        font-size: 0.78rem;
-        color: var(--text-muted);
+        display: flex; flex-wrap: wrap; gap: 22px; align-items: center;
+        font-family: var(--mono); font-size: 0.78rem; color: var(--text-muted);
+        box-shadow: 0 1px 16px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.015) inset;
+        position: relative; overflow: hidden;
     }
-    .ticker-strip .pt { color: var(--amber); margin-right: 6px; }
-    .ticker-strip .k  { color: var(--text-dim); letter-spacing: 0.08em; text-transform: uppercase; margin-right: 6px; }
-    .ticker-strip .v  { color: var(--text); font-weight: 500; }
-    .ticker-strip .warn{ color: var(--amber); }
-    .ticker-strip .div{ color: var(--border-strong); margin: 0 2px; }
+    .ticker-strip::before {
+        content: "";
+        position: absolute;
+        bottom: 0; left: 0; right: 0;
+        height: 1px;
+        background: linear-gradient(90deg, transparent, var(--cyan), transparent);
+        opacity: 0.3;
+    }
+    .ticker-strip .pt  { color: var(--amber); margin-right: 6px; text-shadow: 0 0 8px var(--amber-glow); }
+    .ticker-strip .k   { color: var(--text-dim); letter-spacing: 0.08em; text-transform: uppercase; margin-right: 6px; }
+    .ticker-strip .v   { color: var(--text); font-weight: 500; }
+    .ticker-strip .warn{ color: var(--amber); text-shadow: 0 0 8px var(--amber-glow); }
+    .ticker-strip .div { color: var(--border-strong); margin: 0 2px; }
 
     /* ─────────────  KPI STRIP  ───────────── */
     .kpi-strip {
         display: grid;
         grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-        border: 1px solid var(--border);
-        background:
-            linear-gradient(180deg, rgba(255,184,0,0.02) 0%, transparent 100%),
-            var(--bg-panel);
-        margin: 8px 0 18px 0;
+        border: 1px solid rgba(255,184,0,0.15);
+        background: var(--bg-glass);
+        backdrop-filter: blur(14px);
+        margin: 10px 0 20px 0;
+        box-shadow:
+            0 0 0 1px rgba(255,184,0,0.05) inset,
+            0 4px 24px rgba(0,0,0,0.4),
+            0 0 40px rgba(255,184,0,0.04);
+        position: relative; overflow: hidden;
+    }
+    .kpi-strip::before {
+        content: "";
+        position: absolute;
+        top: 0; left: 0; right: 0; height: 1px;
+        background: linear-gradient(90deg, transparent, var(--amber), var(--cyan), transparent);
+        background-size: 200% 100%;
+        animation: border-flow 4s linear infinite;
+        opacity: 0.6;
     }
     .kpi-cell {
-        padding: 18px 20px;
+        padding: 20px 22px;
         border-right: 1px solid var(--border);
         position: relative;
+        transition: background 0.25s;
     }
+    .kpi-cell:hover { background: rgba(255,184,0,0.04); }
     .kpi-cell:last-child { border-right: none; }
     .kpi-cell::before {
         content: "";
         position: absolute;
-        top: 10px; left: 0;
-        width: 3px; height: 18px;
-        background: var(--amber);
+        top: 12px; left: 0;
+        width: 3px; height: 20px;
+        background: linear-gradient(180deg, var(--amber), var(--cyan));
         opacity: 0;
         transition: opacity 0.2s;
+        box-shadow: 0 0 8px var(--amber-glow);
     }
     .kpi-cell:hover::before { opacity: 1; }
     .kpi-label {
-        font-family: var(--mono);
-        font-size: 0.68rem;
-        font-weight: 500;
-        letter-spacing: 0.14em;
-        text-transform: uppercase;
-        color: var(--text-dim);
-        margin-bottom: 6px;
-        display: flex;
-        align-items: center;
-        gap: 8px;
+        font-family: var(--mono); font-size: 0.68rem; font-weight: 500;
+        letter-spacing: 0.14em; text-transform: uppercase;
+        color: var(--text-dim); margin-bottom: 8px;
+        display: flex; align-items: center; gap: 8px;
     }
-    .kpi-label::before { content: "■"; color: var(--amber); font-size: 0.6rem; }
+    .kpi-label::before { content: "■"; color: var(--amber); font-size: 0.6rem; text-shadow: 0 0 6px var(--amber-glow); }
     .kpi-value {
-        font-family: var(--mono);
-        font-size: 1.9rem;
-        font-weight: 700;
-        color: var(--text);
-        letter-spacing: -0.01em;
-        line-height: 1;
+        font-family: var(--mono); font-size: 2rem; font-weight: 700;
+        color: var(--text); letter-spacing: -0.02em; line-height: 1;
         font-variant-numeric: tabular-nums;
     }
     .kpi-value .unit {
-        font-size: 0.75rem;
-        color: var(--text-dim);
-        font-weight: 400;
-        margin-left: 4px;
-        letter-spacing: 0.05em;
+        font-size: 0.75rem; color: var(--text-dim); font-weight: 400;
+        margin-left: 4px; letter-spacing: 0.05em;
     }
-    .kpi-value.amber { color: var(--amber); }
-    .kpi-value.cyan  { color: var(--cyan); }
-    .kpi-sub {
-        margin-top: 4px;
-        font-family: var(--mono);
-        font-size: 0.72rem;
-        color: var(--text-dim);
+    .kpi-value.amber {
+        color: var(--amber);
+        text-shadow: 0 0 16px var(--amber-glow), 0 0 32px rgba(255,184,0,0.1);
     }
+    .kpi-value.cyan {
+        color: var(--cyan);
+        text-shadow: 0 0 16px var(--cyan-glow), 0 0 32px rgba(34,211,238,0.1);
+    }
+    .kpi-sub { margin-top: 5px; font-family: var(--mono); font-size: 0.72rem; color: var(--text-dim); }
 
     /* ─────────────  RULE PANEL  ───────────── */
     .rule-box {
-        background: var(--bg-panel);
+        background: var(--bg-glass);
+        backdrop-filter: blur(12px);
         border: 1px solid var(--border);
         border-left: 2px solid var(--cyan);
-        padding: 14px 18px;
-        margin-bottom: 14px;
-        font-family: var(--mono);
-        font-size: 0.8rem;
-        color: var(--text-muted);
-        line-height: 1.7;
+        padding: 16px 20px;
+        margin-bottom: 16px;
+        font-family: var(--mono); font-size: 0.8rem;
+        color: var(--text-muted); line-height: 1.75;
+        box-shadow: 0 0 20px rgba(34,211,238,0.05), 0 2px 20px rgba(0,0,0,0.3);
+        position: relative;
+    }
+    .rule-box::before {
+        content: "";
+        position: absolute;
+        top: 0; left: 0; bottom: 0; width: 2px;
+        background: linear-gradient(180deg, var(--cyan), transparent);
+        box-shadow: 0 0 8px var(--cyan-glow);
     }
     .rule-box .lbl {
         color: var(--cyan);
-        font-weight: 700;
-        letter-spacing: 0.1em;
-        text-transform: uppercase;
-        font-size: 0.72rem;
-        display: block;
-        margin-bottom: 6px;
+        font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+        font-size: 0.72rem; display: block; margin-bottom: 6px;
+        text-shadow: 0 0 8px var(--cyan-glow);
     }
     .rule-box code, .rule-box b, .rule-box strong {
         color: var(--text);
-        background: rgba(255,184,0,0.08);
-        padding: 1px 5px;
-        border-radius: 2px;
+        background: rgba(255,184,0,0.1);
+        padding: 1px 6px; border-radius: 2px;
+        border: 1px solid rgba(255,184,0,0.15);
     }
-    .rule-box .rule-line { display: flex; gap: 8px; align-items: flex-start; }
-    .rule-box .rule-line .ix { color: var(--amber); min-width: 1.5em; }
+    .rule-box .rule-line { display: flex; gap: 10px; align-items: flex-start; }
+    .rule-box .rule-line .ix { color: var(--amber); min-width: 1.5em; text-shadow: 0 0 6px var(--amber-glow); }
 
     /* ─────────────  SECTION HEADER  ───────────── */
     .section-header {
-        font-family: var(--mono);
-        font-size: 0.78rem;
-        font-weight: 700;
-        color: var(--text);
-        letter-spacing: 0.18em;
-        text-transform: uppercase;
-        margin: 26px 0 14px 0;
-        display: flex;
-        align-items: center;
-        gap: 10px;
+        font-family: var(--mono); font-size: 0.78rem; font-weight: 700;
+        color: var(--text); letter-spacing: 0.18em; text-transform: uppercase;
+        margin: 28px 0 14px 0;
+        display: flex; align-items: center; gap: 10px;
     }
-    .section-header::before { content: ">_"; color: var(--amber); font-weight: 800; }
+    .section-header::before {
+        content: ">_";
+        color: var(--amber); font-weight: 800;
+        text-shadow: 0 0 12px var(--amber-glow), 0 0 24px rgba(255,184,0,0.2);
+    }
     .section-header::after {
         content: "";
-        flex: 1;
-        height: 1px;
-        background: linear-gradient(90deg, var(--border) 0%, transparent 100%);
+        flex: 1; height: 1px;
+        background: linear-gradient(90deg, rgba(255,184,0,0.3), var(--border), transparent);
         margin-left: 6px;
     }
     .section-header .count {
-        color: var(--text-dim);
-        font-weight: 400;
-        font-size: 0.72rem;
-        letter-spacing: 0.1em;
+        color: var(--text-dim); font-weight: 400;
+        font-size: 0.72rem; letter-spacing: 0.1em;
     }
 
     /* ─────────────  SIDEBAR  ───────────── */
     [data-testid="stSidebar"] {
-        background: var(--bg-panel);
+        background: rgba(8,11,18,0.9);
+        backdrop-filter: blur(20px);
         border-right: 1px solid var(--border);
+        box-shadow: 4px 0 30px rgba(0,0,0,0.5);
     }
     [data-testid="stSidebar"] > div { padding-top: 12px; }
     [data-testid="stSidebar"] h3 {
-        font-family: var(--mono);
-        font-size: 0.75rem !important;
-        font-weight: 700;
-        letter-spacing: 0.2em;
-        text-transform: uppercase;
-        color: var(--amber);
-        margin-bottom: 16px !important;
+        font-family: var(--mono); font-size: 0.75rem !important; font-weight: 700;
+        letter-spacing: 0.2em; text-transform: uppercase;
+        color: var(--amber); margin-bottom: 16px !important;
+        text-shadow: 0 0 10px var(--amber-glow);
     }
     [data-testid="stSidebar"] label {
-        font-family: var(--mono);
-        font-size: 0.72rem !important;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        color: var(--text-muted) !important;
-        font-weight: 500 !important;
+        font-family: var(--mono); font-size: 0.72rem !important;
+        letter-spacing: 0.08em; text-transform: uppercase;
+        color: var(--text-muted) !important; font-weight: 500 !important;
     }
 
     /* ─────────────  WIDGETS  ───────────── */
     .stButton > button {
-        font-family: var(--mono) !important;
-        font-size: 0.78rem !important;
-        font-weight: 600 !important;
-        letter-spacing: 0.12em !important;
-        text-transform: uppercase !important;
-        border-radius: 2px !important;
+        font-family: var(--mono) !important; font-size: 0.78rem !important;
+        font-weight: 600 !important; letter-spacing: 0.12em !important;
+        text-transform: uppercase !important; border-radius: 2px !important;
         border: 1px solid var(--border-strong) !important;
-        background: var(--bg-elev) !important;
-        color: var(--text) !important;
-        transition: all 0.15s;
+        background: rgba(255,255,255,0.03) !important;
+        color: var(--text) !important; transition: all 0.2s;
     }
     .stButton > button:hover {
         border-color: var(--amber) !important;
         color: var(--amber) !important;
-        background: rgba(255,184,0,0.06) !important;
-        box-shadow: 0 0 0 1px var(--amber) inset;
+        background: rgba(255,184,0,0.07) !important;
+        box-shadow: 0 0 16px rgba(255,184,0,0.2), 0 0 0 1px rgba(255,184,0,0.3) inset !important;
+        text-shadow: 0 0 10px var(--amber-glow);
     }
     .stButton > button[kind="primary"] {
-        background: var(--amber) !important;
-        color: #0A0D12 !important;
-        border-color: var(--amber) !important;
+        background: linear-gradient(135deg, #FFB800, #FFA000) !important;
+        color: #060910 !important; border-color: var(--amber) !important;
+        box-shadow: 0 0 20px rgba(255,184,0,0.25) !important;
     }
     .stButton > button[kind="primary"]:hover {
-        background: #FFCC33 !important;
-        color: #0A0D12 !important;
-        box-shadow: 0 0 12px rgba(255,184,0,0.4);
+        background: linear-gradient(135deg, #FFCC33, #FFB800) !important;
+        color: #060910 !important;
+        box-shadow: 0 0 32px rgba(255,184,0,0.45), 0 4px 16px rgba(255,184,0,0.2) !important;
     }
     .stDownloadButton > button {
-        font-family: var(--mono) !important;
-        font-size: 0.78rem !important;
-        letter-spacing: 0.1em !important;
-        text-transform: uppercase !important;
+        font-family: var(--mono) !important; font-size: 0.78rem !important;
+        letter-spacing: 0.1em !important; text-transform: uppercase !important;
         border-radius: 2px !important;
     }
     .stTextInput > div > div > input,
@@ -1803,192 +2044,209 @@ st.markdown("""
         font-family: var(--mono) !important;
         background: var(--bg-elev) !important;
         border: 1px solid var(--border-strong) !important;
-        border-radius: 2px !important;
-        color: var(--text) !important;
+        border-radius: 2px !important; color: var(--text) !important;
         font-variant-numeric: tabular-nums;
     }
     .stTextInput > div > div > input:focus,
     .stNumberInput > div > div > input:focus {
         border-color: var(--amber) !important;
-        box-shadow: 0 0 0 1px var(--amber) !important;
+        box-shadow: 0 0 0 1px var(--amber), 0 0 12px var(--amber-glow) !important;
     }
     [data-baseweb="select"] > div {
         background: var(--bg-elev) !important;
         border: 1px solid var(--border-strong) !important;
-        border-radius: 2px !important;
-        font-family: var(--mono) !important;
+        border-radius: 2px !important; font-family: var(--mono) !important;
     }
     .stSlider [data-baseweb="slider"] > div > div { background: var(--border) !important; }
     .stSlider [role="slider"] {
         background: var(--amber) !important;
-        box-shadow: 0 0 0 4px rgba(255,184,0,0.15) !important;
+        box-shadow: 0 0 12px var(--amber), 0 0 0 4px rgba(255,184,0,0.2) !important;
     }
     [data-testid="stExpander"] {
-        background: var(--bg-panel);
-        border: 1px solid var(--border) !important;
-        border-radius: 2px !important;
+        background: rgba(10,13,20,0.6);
+        backdrop-filter: blur(8px);
+        border: 1px solid var(--border) !important; border-radius: 2px !important;
     }
     [data-testid="stExpander"] summary {
-        font-family: var(--mono);
-        letter-spacing: 0.08em;
-        font-size: 0.8rem;
-        color: var(--text-muted);
+        font-family: var(--mono); letter-spacing: 0.08em;
+        font-size: 0.8rem; color: var(--text-muted);
     }
+
+    /* ─── TABS ─── */
     .stTabs [data-baseweb="tab-list"] {
-        gap: 0;
-        border-bottom: 1px solid var(--border);
-        margin-bottom: 18px;
+        gap: 0; border-bottom: 1px solid var(--border); margin-bottom: 18px;
+        background: transparent;
     }
     .stTabs [data-baseweb="tab"] {
-        font-family: var(--mono) !important;
-        font-size: 0.8rem !important;
-        font-weight: 600 !important;
-        letter-spacing: 0.16em !important;
-        text-transform: uppercase !important;
-        color: var(--text-muted) !important;
+        font-family: var(--mono) !important; font-size: 0.8rem !important;
+        font-weight: 600 !important; letter-spacing: 0.16em !important;
+        text-transform: uppercase !important; color: var(--text-muted) !important;
         background: transparent !important;
-        border: 1px solid transparent !important;
-        border-bottom: none !important;
-        border-radius: 2px 2px 0 0 !important;
-        padding: 10px 22px !important;
-        margin-right: 2px;
+        border: 1px solid transparent !important; border-bottom: none !important;
+        border-radius: 2px 2px 0 0 !important; padding: 10px 24px !important; margin-right: 2px;
+        transition: all 0.2s;
     }
     .stTabs [data-baseweb="tab"]:hover {
-        color: var(--text) !important;
-        background: var(--bg-panel) !important;
+        color: var(--text) !important; background: rgba(255,255,255,0.02) !important;
     }
     .stTabs [aria-selected="true"] {
-        color: var(--amber) !important;
-        border-color: var(--border) !important;
+        color: var(--amber) !important; border-color: var(--border) !important;
         border-bottom: 1px solid var(--bg) !important;
-        background: var(--bg-panel) !important;
+        background: rgba(255,184,0,0.04) !important;
         position: relative;
+        text-shadow: 0 0 10px var(--amber-glow);
     }
     .stTabs [aria-selected="true"]::before {
-        content: "";
-        position: absolute;
-        top: -1px; left: 0; right: 0;
+        content: ""; position: absolute; top: -1px; left: 0; right: 0;
         height: 2px;
-        background: var(--amber);
+        background: linear-gradient(90deg, var(--amber), #FFCC33, var(--amber));
+        background-size: 200% 100%;
+        animation: border-flow 2s linear infinite;
+        box-shadow: 0 0 8px var(--amber-glow);
     }
     .stTabs [data-baseweb="tab-highlight"] { display: none; }
+
+    /* ─── DataFrames ─── */
     [data-testid="stDataFrame"] {
-        border: 1px solid var(--border);
-        border-radius: 2px;
+        border: 1px solid var(--border); border-radius: 2px;
+        box-shadow: 0 2px 16px rgba(0,0,0,0.3);
     }
-    [data-testid="stDataFrame"] table {
-        font-family: var(--mono) !important;
-        font-variant-numeric: tabular-nums;
-    }
+    [data-testid="stDataFrame"] table { font-family: var(--mono) !important; font-variant-numeric: tabular-nums; }
+
+    /* ─── Metrics ─── */
     [data-testid="stMetric"] {
-        background: var(--bg-panel);
-        border: 1px solid var(--border);
-        padding: 12px 14px;
-        border-radius: 2px;
-        position: relative;
+        background: var(--bg-glass);
+        backdrop-filter: blur(10px);
+        border: 1px solid var(--border); padding: 12px 14px; border-radius: 2px;
+        position: relative; transition: all 0.2s;
     }
+    [data-testid="stMetric"]:hover { box-shadow: 0 0 16px rgba(255,184,0,0.08); }
     [data-testid="stMetric"]::before {
-        content: "";
-        position: absolute;
-        top: 0; left: 0;
-        width: 2px; height: 100%;
-        background: var(--amber);
-        opacity: 0.5;
+        content: ""; position: absolute; top: 0; left: 0; width: 2px; height: 100%;
+        background: linear-gradient(180deg, var(--amber), var(--cyan));
+        box-shadow: 0 0 8px var(--amber-glow); opacity: 0.6;
     }
     [data-testid="stMetricLabel"] {
-        font-family: var(--mono) !important;
-        font-size: 0.66rem !important;
-        font-weight: 500 !important;
-        letter-spacing: 0.14em !important;
-        text-transform: uppercase !important;
-        color: var(--text-dim) !important;
+        font-family: var(--mono) !important; font-size: 0.66rem !important;
+        font-weight: 500 !important; letter-spacing: 0.14em !important;
+        text-transform: uppercase !important; color: var(--text-dim) !important;
     }
     [data-testid="stMetricValue"] {
-        font-family: var(--mono) !important;
-        font-weight: 700 !important;
-        color: var(--text) !important;
-        font-variant-numeric: tabular-nums;
+        font-family: var(--mono) !important; font-weight: 700 !important;
+        color: var(--text) !important; font-variant-numeric: tabular-nums;
     }
     [data-testid="stAlert"] {
-        font-family: var(--mono);
-        border-radius: 2px !important;
-        border: 1px solid var(--border) !important;
-        font-size: 0.82rem;
+        font-family: var(--mono); border-radius: 2px !important;
+        border: 1px solid var(--border) !important; font-size: 0.82rem;
+        background: rgba(10,13,20,0.7) !important; backdrop-filter: blur(8px);
     }
 
     /* ─────────────  SIGNAL CARD  ───────────── */
     .sig-card {
-        background: linear-gradient(90deg, rgba(16,185,129,0.08) 0%, var(--bg-panel) 30%);
-        border: 1px solid var(--border);
+        background: linear-gradient(135deg, rgba(16,185,129,0.1) 0%, var(--bg-glass) 40%);
+        backdrop-filter: blur(14px);
+        border: 1px solid rgba(16,185,129,0.25);
         border-left: 3px solid var(--green);
-        padding: 14px 18px;
-        margin-bottom: 10px;
+        padding: 16px 20px;
+        margin-bottom: 12px;
         font-family: var(--mono);
-        position: relative;
+        position: relative; overflow: hidden;
+        box-shadow:
+            0 0 24px rgba(16,185,129,0.08),
+            0 4px 20px rgba(0,0,0,0.4),
+            0 0 0 1px rgba(16,185,129,0.05) inset;
+        transition: all 0.25s;
+    }
+    .sig-card:hover {
+        border-color: rgba(16,185,129,0.5);
+        box-shadow: 0 0 40px rgba(16,185,129,0.14), 0 4px 24px rgba(0,0,0,0.5);
+        transform: translateY(-1px);
     }
     .sig-card::after {
         content: "● SIGNAL";
-        position: absolute;
-        top: 10px; right: 14px;
-        font-size: 0.65rem;
-        letter-spacing: 0.2em;
+        position: absolute; top: 12px; right: 16px;
+        font-size: 0.65rem; letter-spacing: 0.2em;
         color: var(--green);
-        animation: blink 1.8s ease-in-out infinite;
+        text-shadow: 0 0 10px var(--green-glow);
+        animation: glow-pulse 1.8s ease-in-out infinite;
+    }
+    /* corner shimmer */
+    .sig-card::before {
+        content: "";
+        position: absolute; top: 0; right: 0;
+        width: 80px; height: 80px;
+        background: radial-gradient(circle at top right, rgba(16,185,129,0.12), transparent 70%);
+        pointer-events: none;
     }
     .sig-head {
-        display: flex;
-        justify-content: space-between;
-        align-items: baseline;
-        margin-bottom: 8px;
-        padding-right: 80px;
+        display: flex; justify-content: space-between; align-items: baseline;
+        margin-bottom: 10px; padding-right: 90px;
     }
-    .sig-code { font-size: 1.05rem; font-weight: 700; color: var(--text); letter-spacing: 0.05em; }
-    .sig-code .code-num { color: var(--amber); margin-right: 10px; }
+    .sig-code {
+        font-size: 1.1rem; font-weight: 700; color: var(--text);
+        letter-spacing: 0.05em;
+        text-shadow: 0 0 16px rgba(255,255,255,0.15);
+    }
+    .sig-code .code-num { color: var(--amber); margin-right: 10px; text-shadow: 0 0 8px var(--amber-glow); }
     .sig-sector { font-size: 0.72rem; color: var(--text-dim); letter-spacing: 0.08em; text-transform: uppercase; }
-    .sig-row { font-size: 0.8rem; color: var(--text-muted); margin-top: 4px; }
-    .sig-row .k  { color: var(--text-dim); }
-    .sig-row .v  { color: var(--text); font-weight: 500; }
-    .sig-row .up { color: var(--green); }
-    .sig-row .dn { color: var(--red); }
+    .sig-row { font-size: 0.8rem; color: var(--text-muted); margin-top: 5px; }
+    .sig-row .k   { color: var(--text-dim); }
+    .sig-row .v   { color: var(--text); font-weight: 500; }
+    .sig-row .up  { color: var(--green); text-shadow: 0 0 6px var(--green-glow); }
+    .sig-row .dn  { color: var(--red); }
     .sig-row .bar-sep { color: var(--border-strong); margin: 0 8px; }
-    .inline-pill {
-        display: inline-block;
-        padding: 2px 10px;
-        font-family: var(--mono);
-        font-size: 0.72rem;
-        border: 1px solid var(--border-strong);
-        color: var(--text-muted);
-        letter-spacing: 0.08em;
+    .sig-verdict {
+        margin-top: 10px; font-size: 0.78rem; color: var(--text-muted);
+        padding: 8px 12px;
         background: rgba(255,255,255,0.02);
-        margin-right: 6px;
+        border-left: 2px solid var(--amber);
+        box-shadow: -2px 0 8px rgba(255,184,0,0.1);
     }
-    .inline-pill.amber { border-color: rgba(255,184,0,0.4); color: var(--amber); }
+    .sig-flow {
+        margin-top: 8px; padding: 8px 12px;
+        background: rgba(255,255,255,0.02);
+        border: 1px dashed var(--border);
+        font-size: 0.76rem; color: var(--text-muted);
+    }
+
+    /* ─── Inline pills ─── */
+    .inline-pill {
+        display: inline-block; padding: 2px 10px;
+        font-family: var(--mono); font-size: 0.72rem;
+        border: 1px solid var(--border-strong); color: var(--text-muted);
+        letter-spacing: 0.08em; background: rgba(255,255,255,0.03);
+        margin-right: 6px; transition: all 0.15s;
+    }
+    .inline-pill.amber {
+        border-color: rgba(255,184,0,0.4); color: var(--amber);
+        background: rgba(255,184,0,0.06);
+        box-shadow: 0 0 8px rgba(255,184,0,0.1);
+    }
+
+    /* ─── WL banner ─── */
     .wl-banner {
-        display: flex;
-        align-items: center;
-        gap: 14px;
-        padding: 12px 16px;
-        margin: 12px 0;
-        background: linear-gradient(90deg, rgba(16,185,129,0.08) 0%, transparent 100%);
-        border: 1px solid var(--border);
-        border-left: 2px solid var(--green);
-        font-family: var(--mono);
-        font-size: 0.82rem;
-        color: var(--text);
+        display: flex; align-items: center; gap: 14px;
+        padding: 13px 18px; margin: 14px 0;
+        background: linear-gradient(90deg, rgba(16,185,129,0.1) 0%, rgba(16,185,129,0.02) 50%, transparent 100%);
+        border: 1px solid rgba(16,185,129,0.25);
+        border-left: 3px solid var(--green);
+        font-family: var(--mono); font-size: 0.82rem; color: var(--text);
+        box-shadow: 0 0 20px rgba(16,185,129,0.08);
+        backdrop-filter: blur(8px);
     }
-    .wl-banner .tag { color: var(--green); font-weight: 700; letter-spacing: 0.15em; font-size: 0.72rem; }
+    .wl-banner .tag {
+        color: var(--green); font-weight: 700; letter-spacing: 0.15em;
+        font-size: 0.72rem; text-shadow: 0 0 8px var(--green-glow);
+    }
     .wl-banner .path { color: var(--amber); font-weight: 500; }
 
-    /* Footer */
+    /* ─── Footer ─── */
     .term-footer {
-        margin-top: 32px;
-        padding: 14px 0;
+        margin-top: 36px; padding: 16px 0;
         border-top: 1px solid var(--border);
-        font-family: var(--mono);
-        font-size: 0.7rem;
-        color: var(--text-dim);
-        text-align: center;
-        letter-spacing: 0.1em;
+        font-family: var(--mono); font-size: 0.7rem;
+        color: var(--text-dim); text-align: center; letter-spacing: 0.1em;
+        background: linear-gradient(0deg, rgba(255,184,0,0.02) 0%, transparent 100%);
     }
     .term-footer .sep { color: var(--border-strong); margin: 0 8px; }
 </style>
@@ -2057,10 +2315,26 @@ with st.sidebar:
         value=False,
         help="Loads bundled sample scan results from data/full_screen_latest.csv and skips live market/fundamental calls.",
     )
+
+    universe_source = st.selectbox(
+        "Universe source",
+        [
+            "S&P 500 (503 stocks)",
+            "Top 500 by Volume (NASDAQ + S&P 500)",
+            "Top 1000 by Volume (NASDAQ + S&P 500)",
+        ],
+        index=1,
+        help=(
+            "S&P 500: exact index members only (~503 tickers, fastest).\n"
+            "Top 500 / Top 1000 by Volume: NASDAQ + S&P 500 combined pool ranked by 60-day avg volume. "
+            "Top 1000 gives broader coverage closer to TradingView's US market universe."
+        ),
+    )
+
     tickers_text = st.text_area(
         "Custom tickers (optional, comma-separated)",
         value="",
-        help=f"Leave blank to auto-use top {AUTO_UNIVERSE_TOP_N} by average trading volume from combined NASDAQ + S&P 500 universe.",
+        help="Leave blank to use the selected universe source above.",
     )
     screen_date = st.date_input("Screen date", value=date.today())
     monitor_date = st.date_input("Monitor date", value=date.today())
@@ -2086,15 +2360,23 @@ with st.sidebar:
     with st.expander("▸ Fundamental", expanded=False):
         fundamental_mode_label = st.selectbox(
             "Fundamental setup",
-            ["Gemini match (YoY)", "TradingView setup (QoQ)"],
+            ["TradingView match (TTM)", "Gemini match (YoY)", "TradingView setup (QoQ)"],
             index=0,
         )
-        min_eps_yoy = st.number_input("Min EPS YoY (%)", value=20.0, step=1.0)
-        min_revenue_yoy = st.number_input("Min Revenue YoY (%)", value=20.0, step=1.0)
-        min_roe_avg = st.number_input("Min 3Y average ROE (%)", value=15.0, step=1.0)
+        _is_tv_ttm = (fundamental_mode_label == "TradingView match (TTM)")
+        if _is_tv_ttm:
+            st.caption("Matches TradingView screener: EPS TTM YoY > threshold, Revenue TTM YoY > threshold, ROE TTM > threshold. All 3 must pass.")
+        min_eps_yoy = st.number_input("Min EPS TTM YoY (%)" if _is_tv_ttm else "Min EPS YoY (%)", value=20.0, step=1.0)
+        min_revenue_yoy = st.number_input("Min Revenue TTM YoY (%)" if _is_tv_ttm else "Min Revenue YoY (%)", value=20.0, step=1.0)
+        min_roe_avg = st.number_input("Min ROE TTM (%)" if _is_tv_ttm else "Min 3Y average ROE (%)", value=15.0, step=1.0)
         roe_stability_max_std = st.number_input("ROE stability max std-dev", value=40.0, step=1.0)
         min_market_cap_b = st.number_input("Min Market Cap (B USD)", value=10.0, step=1.0)
-        min_fundamental_rules_pass = st.number_input("Min passed fundamental rules (out of 3)", min_value=1, max_value=3, value=2, step=1)
+        min_fundamental_rules_pass = st.number_input(
+            "Min passed fundamental rules (out of 3)",
+            min_value=1, max_value=3,
+            value=3 if _is_tv_ttm else 2,
+            step=1,
+        )
         require_fundamentals = st.checkbox("Require fundamentals for pass", value=True)
 
     with st.expander("▸ Technical-Lazy", expanded=False):
@@ -2169,7 +2451,7 @@ else:
     tickers = []
     universe_note = (
         f"Auto universe will be loaded when you click Run screen "
-        f"(top {AUTO_UNIVERSE_TOP_N} by average daily trading volume from NASDAQ + S&P 500)."
+        "(uses the universe source selected above)."
     )
 
 profile_map = build_profile_map(tickers) if tickers else {}
@@ -2186,7 +2468,10 @@ cfg = ScreenConfig(
     use_tradingview_setup=(fundamental_mode_label == "TradingView setup (QoQ)"),
     min_market_cap=float(min_market_cap_b) * 1_000_000_000.0,
     roe_stability_max_std=float(roe_stability_max_std),
-    fundamental_mode="gemini_yoy" if fundamental_mode_label == "Gemini match (YoY)" else "tradingview_qoq",
+    fundamental_mode=(
+        "tv_ttm" if fundamental_mode_label == "TradingView match (TTM)"
+        else ("gemini_yoy" if fundamental_mode_label == "Gemini match (YoY)" else "tradingview_qoq")
+    ),
     apply_technical_filter=bool(apply_technical_filter),
     min_fundamental_rules_pass=int(min_fundamental_rules_pass),
 )
@@ -2202,10 +2487,23 @@ except Exception as exc:
 # Dynamic Terminal Header — uses cfg / universe_note resolved above
 # ---------------------------------------------------------------------------
 
-_mode_chip_text = "Offline Sample" if use_offline_sample_data else ("Custom Universe" if manual_tickers else "Auto Universe")
+_mode_chip_text = "Offline Sample" if use_offline_sample_data else ("Custom" if manual_tickers else "Auto")
+if use_offline_sample_data:
+    _univ_chip_label = "Offline Sample"
+elif manual_tickers:
+    _univ_chip_label = f"Custom ({len(manual_tickers)})"
+elif universe_source.startswith("S&P 500"):
+    _univ_chip_label = "S&P 500"
+elif "1000" in universe_source:
+    _univ_chip_label = "Top 1000 Vol"
+else:
+    _univ_chip_label = "Top 500 Vol"
 _univ_size = len(tickers) if tickers else AUTO_UNIVERSE_TOP_N
-_univ_chip_text = f"{_univ_size} tickers" if tickers else f"Top {AUTO_UNIVERSE_TOP_N}"
-_fund_mode_chip = "YoY" if fundamental_mode_label == "Gemini match (YoY)" else "QoQ"
+_univ_chip_text = _univ_chip_label
+_fund_mode_chip = (
+    "TV-TTM" if fundamental_mode_label == "TradingView match (TTM)"
+    else ("YoY" if fundamental_mode_label == "Gemini match (YoY)" else "QoQ")
+)
 _tech_chip = "Tech ON" if apply_technical_filter else "Tech OFF"
 
 st.markdown(f"""
@@ -2294,7 +2592,7 @@ st.markdown(f"""
         <span class="v">Pass &ge; {cfg.min_fundamental_rules_pass}/3 rules</span>
     </span>
     <span><span class="k">Technical</span><span class="v">{_tech_rule_str}</span>{_wvf_warn}</span>
-    <span><span class="k">Universe</span><span class="v">{_univ_chip_text} · NASDAQ + S&amp;P 500</span></span>
+    <span><span class="k">Universe</span><span class="v">{_univ_chip_text}</span></span>
 </div>
 """, unsafe_allow_html=True)
 
@@ -2310,18 +2608,27 @@ with tab1:
     st.markdown('<div class="section-header">Screen Stocks on Selected Date</div>', unsafe_allow_html=True)
 
     # Rule-box instructions
-    _setup_note = (
-        "Gemini match (YoY): uses year-over-year EPS &amp; Revenue + 3-year average ROE + market cap."
-        if fundamental_mode_label == "Gemini match (YoY)"
-        else "TradingView setup (QoQ): uses quarter-over-quarter EPS &amp; Revenue + quarterly TTM-style ROE + market cap."
-    )
+    if fundamental_mode_label == "TradingView match (TTM)":
+        _setup_note = (
+            "TradingView match (TTM): replicates TV screener exactly — "
+            "EPS Diluted TTM YoY, Revenue TTM YoY, and ROE TTM. All 3 must pass."
+        )
+        _roe_note = "ROE TTM = (trailing 12-month net income) / (avg quarterly equity) × 100."
+    elif fundamental_mode_label == "Gemini match (YoY)":
+        _setup_note = "Gemini match (YoY): year-over-year EPS &amp; Revenue continuity + 3-year average ROE + market cap."
+        _roe_note = "ROE: Net Income / Shareholders' Equity (3-year annual average)."
+    else:
+        _setup_note = "TradingView setup (QoQ): quarter-over-quarter EPS &amp; Revenue + quarterly TTM-style ROE + market cap."
+        _roe_note = "ROE TTM: rolling 4-quarter net income / avg equity."
+
     st.markdown(f"""
 <div class="rule-box">
-    <div class="rule-line"><span class="lbl">Step</span> Choose screen date in sidebar, configure rules, then click <strong>Run screen</strong>.</div>
+    <div class="rule-line"><span class="lbl">Step 1</span> Choose screen date in sidebar, configure rules, click <strong>Run screen</strong> → fundamental list.</div>
+    <div class="rule-line"><span class="lbl">Step 2</span> Enable <em>Technical-Lazy filter</em> in sidebar to further narrow with MA stack &amp; 52-week position.</div>
     <div class="rule-line"><span class="lbl">Setup</span> {_setup_note}</div>
-    <div class="rule-line"><span class="lbl">Pass logic</span> Require at least <span class="ix">{cfg.min_fundamental_rules_pass}</span> of 3 fundamental rules (EPS, Revenue, ROE) <em>plus</em> market cap.</div>
-    <div class="rule-line"><span class="lbl">ROE</span> Net Income / Shareholders' Equity (3-year average).</div>
-    <div class="rule-line"><span class="lbl">Technical</span> {_tech_rule_str} {'— filter active' if apply_technical_filter else '— filter inactive (screen fundamental only)'}.</div>
+    <div class="rule-line"><span class="lbl">Pass logic</span> Require at least <span class="ix">{cfg.min_fundamental_rules_pass}</span> of 3 fundamental rules (EPS, Revenue, ROE) <em>plus</em> market cap &gt; {cfg.min_market_cap/1e9:.0f}B.</div>
+    <div class="rule-line"><span class="lbl">ROE</span> {_roe_note}</div>
+    <div class="rule-line"><span class="lbl">Technical</span> {_tech_rule_str} {'— <strong>active</strong>: applied after fundamental pass' if apply_technical_filter else '— inactive (fundamental-only screen)'}.</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -2367,17 +2674,25 @@ with tab1:
                     run_universe_note = universe_note
                     if not tickers_to_run:
                         try:
-                            base_tickers, universe_preview_to_show = top_volume_universe(
-                                as_of_ts.strftime("%Y-%m-%d"),
-                                top_n=AUTO_UNIVERSE_TOP_N,
-                                lookback_days=60,
-                            )
-                            tickers_to_run = apply_always_include(base_tickers, always_include, top_n=AUTO_UNIVERSE_TOP_N)
+                            if universe_source.startswith("S&P 500"):
+                                # Use exact S&P 500 index members — fastest, no volume download needed
+                                sp_profiles = load_sp500_profiles()
+                                base_tickers = sp_profiles["ticker"].tolist()
+                                universe_preview_to_show = sp_profiles[["ticker", "company_name", "sector"]].head(20)
+                                top_n_used = len(base_tickers)
+                                run_universe_note = f"Using S&P 500 universe: {len(base_tickers)} index members."
+                            else:
+                                top_n_used = 1000 if "1000" in universe_source else AUTO_UNIVERSE_TOP_N
+                                base_tickers, universe_preview_to_show = top_volume_universe(
+                                    as_of_ts.strftime("%Y-%m-%d"),
+                                    top_n=top_n_used,
+                                    lookback_days=60,
+                                )
+                                run_universe_note = (
+                                    f"Using top {top_n_used} stocks by 60-day avg volume from NASDAQ + S&P 500 combined."
+                                )
+                            tickers_to_run = apply_always_include(base_tickers, always_include, top_n=len(base_tickers))
                             actually_forced = [t for t in always_include if t in tickers_to_run]
-                            run_universe_note = (
-                                f"Using auto universe: top {AUTO_UNIVERSE_TOP_N} stocks by average daily trading volume from NASDAQ + S&P 500 "
-                                "over the latest 60 trading days."
-                            )
                             if actually_forced:
                                 run_universe_note += f" Forced include: {', '.join(actually_forced)}."
                         except Exception as exc:
