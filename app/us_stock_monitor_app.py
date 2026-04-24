@@ -1646,15 +1646,15 @@ st.markdown("""
 
     :root {
         --bg:           #060910;
-        --bg-elev:      #0E1219;
-        --bg-hover:     #1A2028;
+        --bg-elev:      #141C2A;
+        --bg-hover:     #243246;
         --bg-panel:     #0A0D14;
         --bg-glass:     rgba(10,13,20,0.72);
-        --border:       #1A2535;
-        --border-strong:#283545;
-        --text:         #E5E7EB;
-        --text-muted:   #9CA3AF;
-        --text-dim:     #5A6478;
+        --border:       #2A3A52;
+        --border-strong:#3F5676;
+        --text:         #F4F8FF;
+        --text-muted:   #C7D3E6;
+        --text-dim:     #92A3BF;
         --amber:        #FFB800;
         --amber-dim:    #A37700;
         --amber-glow:   rgba(255,184,0,0.35);
@@ -2050,7 +2050,7 @@ st.markdown("""
 
     /* ─────────────  SIDEBAR  ───────────── */
     [data-testid="stSidebar"] {
-        background: rgba(8,11,18,0.9);
+        background: rgba(10,15,24,0.96);
         backdrop-filter: blur(20px);
         border-right: 1px solid var(--border);
         box-shadow: 4px 0 30px rgba(0,0,0,0.5);
@@ -2063,9 +2063,14 @@ st.markdown("""
         text-shadow: 0 0 10px var(--amber-glow);
     }
     [data-testid="stSidebar"] label {
-        font-family: var(--mono); font-size: 0.72rem !important;
+        font-family: var(--mono); font-size: 0.78rem !important;
         letter-spacing: 0.08em; text-transform: uppercase;
-        color: var(--text-muted) !important; font-weight: 500 !important;
+        color: var(--text) !important; font-weight: 600 !important;
+    }
+    [data-testid="stSidebar"] p,
+    [data-testid="stSidebar"] span,
+    [data-testid="stSidebar"] .stCaption {
+        color: var(--text-muted) !important;
     }
 
     /* ─────────────  WIDGETS  ───────────── */
@@ -2101,12 +2106,18 @@ st.markdown("""
     }
     .stTextInput > div > div > input,
     .stNumberInput > div > div > input,
-    .stDateInput input {
+    .stDateInput input,
+    .stTextArea textarea {
         font-family: var(--mono) !important;
         background: var(--bg-elev) !important;
         border: 1px solid var(--border-strong) !important;
         border-radius: 2px !important; color: var(--text) !important;
         font-variant-numeric: tabular-nums;
+    }
+    .stTextInput > div > div > input::placeholder,
+    .stTextArea textarea::placeholder {
+        color: var(--text-dim) !important;
+        opacity: 1 !important;
     }
     .stTextInput > div > div > input:focus,
     .stNumberInput > div > div > input:focus {
@@ -2117,6 +2128,10 @@ st.markdown("""
         background: var(--bg-elev) !important;
         border: 1px solid var(--border-strong) !important;
         border-radius: 2px !important; font-family: var(--mono) !important;
+        color: var(--text) !important;
+    }
+    [data-baseweb="select"] * {
+        color: var(--text) !important;
     }
     .stSlider [data-baseweb="slider"] > div > div { background: var(--border) !important; }
     .stSlider [role="slider"] {
