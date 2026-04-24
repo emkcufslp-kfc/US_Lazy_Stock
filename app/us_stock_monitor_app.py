@@ -1089,7 +1089,7 @@ def eval_fundamental(
             "eps_vals": [eps_ttm_yoy],
             "rev_vals": [rev_ttm_yoy],
             "fundamental_rules_hit": fundamental_rules_hit,
-            "note": "TradingView match: TTM EPS YoY + TTM Revenue YoY + TTM ROE (all 3 must pass)",
+            "note": f"TradingView match: TTM EPS YoY + TTM Revenue YoY + TTM ROE (at least {cfg.min_fundamental_rules_pass} must pass)",
         }
 
     if cfg.fundamental_mode == "gemini_yoy":
@@ -1315,26 +1315,83 @@ def eval_technical(df: pd.DataFrame, as_of_date: pd.Timestamp, cfg: ScreenConfig
     return bool(ma_rules_pass and within_high and above_low), out
 
 
-def buy_zone_rule(ticker: str, df: pd.DataFrame, now_date: pd.Timestamp) -> bool:
-    return False
+def buy_zone_rule(ticker: str, df: pd.DataFrame, now_date: pd.Timestamp) -> Tuple[bool, str]:
+    temp = df[df.index <= now_date]
+    if temp.empty:
+        return False, ""
+
+    row = temp.iloc[-1]
+    close = float(row.get("Close", 0))
+    ma50 = float(row.get("MA50", 0))
+    ma150 = float(row.get("MA150", 0))
+    ma200 = float(row.get("MA200", 0))
+    high_52w = float(row.get("HIGH_52W", 0))
+
+    # 1. Trend Breakout: MA Stack + Close near 52W High (requires longer history)
+    if len(temp) >= 200 and ma50 > ma150 > ma200 and close > ma50:
+        if high_52w > 0 and close >= high_52w * 0.95:
+            return True, "Bullish crossover + near 52W High breakout."
+
+    # 2. Bottoming Signal: WVF Green in last 3 days with trend guard
+    recent_3 = temp.tail(3)
+    if "WVF_GREEN" in recent_3.columns and bool(recent_3["WVF_GREEN"].any()):
+        has_ma200 = pd.notna(ma200) and ma200 > 0
+        if has_ma200 and close > ma200:
+            return True, "WVF bottom signal detected while above primary trend (MA200)."
+        if (not has_ma200) and pd.notna(ma50) and ma50 > 0 and close > ma50:
+            return True, "WVF bottom signal detected (MA200 unavailable; using MA50 trend guard)."
+
+    return False, ""
 
 
-def sell_zone_rule(ticker: str, df: pd.DataFrame, now_date: pd.Timestamp) -> bool:
-    return False
+def sell_zone_rule(ticker: str, df: pd.DataFrame, now_date: pd.Timestamp) -> Tuple[bool, str]:
+    temp = df[df.index <= now_date]
+    if temp.empty:
+        return False, ""
+
+    row = temp.iloc[-1]
+    close = float(row.get("Close", 0))
+    ma50 = float(row.get("MA50", 0))
+    ma150 = float(row.get("MA150", 0))
+    ma200 = float(row.get("MA200", 0))
+
+    if ma150 > 0 and close < ma150:
+        if ma200 > 0 and close < ma200:
+            return True, "Price broke below MA200 (Major Trend Exit)."
+        return True, "Price broke below MA150 (Intermediate Trend Exit)."
+
+    return False, ""
 
 
-def hold_zone_rule(ticker: str, df: pd.DataFrame, now_date: pd.Timestamp) -> bool:
-    return False
+def hold_zone_rule(ticker: str, df: pd.DataFrame, now_date: pd.Timestamp) -> Tuple[bool, str]:
+    temp = df[df.index <= now_date]
+    if temp.empty:
+        return False, ""
+
+    row = temp.iloc[-1]
+    close = float(row.get("Close", 0))
+    ma200 = float(row.get("MA200", 0))
+
+    if ma200 > 0 and close > ma200:
+        return True, "Holding above primary trend (MA200)."
+
+    return False, ""
 
 
-def derive_action_status(ticker: str, df: pd.DataFrame, now_date: pd.Timestamp) -> str:
-    if sell_zone_rule(ticker, df, now_date):
-        return "SELL"
-    if buy_zone_rule(ticker, df, now_date):
-        return "BUY"
-    if hold_zone_rule(ticker, df, now_date):
-        return "HOLD"
-    return "WATCH"
+def derive_action_status(ticker: str, df: pd.DataFrame, now_date: pd.Timestamp) -> Tuple[str, str]:
+    is_sell, sell_note = sell_zone_rule(ticker, df, now_date)
+    if is_sell:
+        return "SELL", sell_note
+
+    is_buy, buy_note = buy_zone_rule(ticker, df, now_date)
+    if is_buy:
+        return "BUY", buy_note
+
+    is_hold, hold_note = hold_zone_rule(ticker, df, now_date)
+    if is_hold:
+        return "HOLD", hold_note
+
+    return "WATCH", "Awaiting trend setup or signal."
 
 
 def watchlist_filename(as_of_date: pd.Timestamp) -> str:
@@ -1549,9 +1606,10 @@ def monitor_watchlist(
                 wvf_last_green_upper_band = last_green_upper
                 wvf_last_green_range_high = last_green_range_high
         wvf_green_last_3d = bool(recent_green.any()) if enable_wvf_alert else False
+        action_status, action_note = derive_action_status(ticker, df, monitor_date)
         rows.append({
             "ticker": ticker,
-            "action": derive_action_status(ticker, df, monitor_date),
+            "action": action_status,
             "current_price": float(latest["Close"]),
             "ret_63d": float(latest.get("RET_63D", np.nan)),
             "ma50": float(latest.get("MA50", np.nan)),
@@ -1567,7 +1625,7 @@ def monitor_watchlist(
             "wvf_last_green_upper_band": wvf_last_green_upper_band,
             "wvf_last_green_range_high": wvf_last_green_range_high,
             "wvf_last_green_trigger": wvf_last_green_trigger,
-            "monitor_note": "Rules pending",
+            "monitor_note": action_note,
         })
 
     return watchlist_df.merge(pd.DataFrame(rows), on="ticker", how="left")
@@ -1627,11 +1685,11 @@ st.markdown("""
     }
 
     /* ─── Aurora background ─── */
-    .stApp {
+    .stApp, [data-testid="stAppViewContainer"] {
         background: var(--bg);
         position: relative;
     }
-    .stApp::after {
+    .stApp::after, [data-testid="stAppViewContainer"]::after {
         content: "";
         position: fixed;
         inset: 0;
@@ -1645,7 +1703,7 @@ st.markdown("""
     }
 
     /* ─── Dot-grid + scanline overlay ─── */
-    .stApp::before {
+    .stApp::before, [data-testid="stAppViewContainer"]::before {
         content: "";
         position: fixed;
         inset: 0;
@@ -2614,7 +2672,7 @@ with tab1:
     if fundamental_mode_label == "TradingView match (TTM)":
         _setup_note = (
             "TradingView match (TTM): replicates TV screener exactly — "
-            "EPS Diluted TTM YoY, Revenue TTM YoY, and ROE TTM. All 3 must pass."
+            f"EPS Diluted TTM YoY, Revenue TTM YoY, and ROE TTM. At least {cfg.min_fundamental_rules_pass} must pass."
         )
         _roe_note = "ROE TTM = (trailing 12-month net income) / (avg quarterly equity) × 100."
     elif fundamental_mode_label == "Gemini match (YoY)":
@@ -2840,7 +2898,7 @@ with tab2:
     <div class="rule-line"><span class="lbl">Step</span> Select a saved watchlist (or upload a CSV), set the monitor date in sidebar, then click <strong>Run monitor</strong>.</div>
     <div class="rule-line"><span class="lbl">WVF</span> Williams Vix Fix is the 2nd indicator — it flags potential price-bottom reversals on watchlist stocks.</div>
     <div class="rule-line"><span class="lbl">WVF Status</span> {'<span class="ix">ENABLED</span> — green alerts will appear below when triggered.' if enable_wvf_alert else 'DISABLED — enable in sidebar under Technical-VIX.'}</div>
-    <div class="rule-line"><span class="lbl">Actions</span> BUY / SELL / HOLD are placeholder rules — extend <code>buy_zone_rule()</code> / <code>sell_zone_rule()</code> / <code>hold_zone_rule()</code>.</div>
+    <div class="rule-line"><span class="lbl">Actions</span> BUY / SELL / HOLD are active rules computed from <code>buy_zone_rule()</code> / <code>sell_zone_rule()</code> / <code>hold_zone_rule()</code>.</div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -3044,6 +3102,6 @@ st.markdown("""
     <span class="sep">│</span>
     <span>Saves as <code>US stock dd-MMM-yyyy.csv</code></span>
     <span class="sep">│</span>
-    <span style="color:var(--amber)">BUY / SELL / HOLD rules: placeholder — add to buy_zone_rule() / sell_zone_rule() / hold_zone_rule()</span>
+    <span style="color:var(--amber)">BUY / SELL / HOLD rules: active ? driven by buy_zone_rule() / sell_zone_rule() / hold_zone_rule()</span>
 </div>
 """, unsafe_allow_html=True)
