@@ -1020,6 +1020,38 @@ def load_fundamentals_snapshot(uploaded_file) -> Optional[pd.DataFrame]:
     return df.sort_values(["ticker", "as_of_date"])
 
 
+def load_uploaded_tickers_csv(uploaded_file) -> List[str]:
+    df = pd.read_csv(uploaded_file)
+    if df.empty:
+        raise ValueError("Uploaded tickers CSV is empty.")
+
+    lower_cols = {c.lower().strip(): c for c in df.columns}
+    preferred = ["ticker", "tickers", "symbol", "symbols", "code"]
+    use_col = None
+    for c in preferred:
+        if c in lower_cols:
+            use_col = lower_cols[c]
+            break
+    if use_col is None:
+        use_col = df.columns[0]
+
+    s = (
+        df[use_col]
+        .astype(str)
+        .str.upper()
+        .str.strip()
+        .str.replace(".", "-", regex=False)
+    )
+    s = s[s.str.match(r"^[A-Z][A-Z0-9\-]*$")]
+    out = s.drop_duplicates().tolist()
+    if not out:
+        raise ValueError(
+            "No valid tickers found in uploaded CSV. "
+            "Expected symbols like AAPL, MSFT in a column named ticker/symbol (or first column)."
+        )
+    return out
+
+
 def get_fund_row(ticker: str, as_of_date: pd.Timestamp, fdf: Optional[pd.DataFrame]) -> Optional[pd.Series]:
     if fdf is None:
         return None
@@ -2412,6 +2444,12 @@ with st.sidebar:
         value="",
         help="Leave blank to use the selected universe source above.",
     )
+    tickers_upload_file = st.file_uploader(
+        "Or upload tickers CSV",
+        type=["csv"],
+        help="Upload a CSV with ticker/symbol column (or first column as ticker list). If provided, it overrides custom tickers and auto universe.",
+        key="tickers_upload_file",
+    )
     screen_date = st.date_input("Screen date", value=date.today())
     monitor_date = st.date_input("Monitor date", value=date.today())
     always_include_text = st.text_input(
@@ -2508,6 +2546,12 @@ if prev_selected_screen_date is not None and prev_selected_screen_date != select
 st.session_state["selected_screen_date_str"] = selected_screen_date_str
 
 manual_tickers = [x.strip().upper() for x in tickers_text.split(",") if x.strip()]
+uploaded_tickers: List[str] = []
+if tickers_upload_file is not None:
+    try:
+        uploaded_tickers = load_uploaded_tickers_csv(tickers_upload_file)
+    except Exception as exc:
+        st.error(f"Failed to read uploaded tickers CSV: {exc}")
 always_include = [x.strip().upper() for x in always_include_text.split(",") if x.strip()]
 universe_note = ""
 universe_preview = pd.DataFrame()
@@ -2520,6 +2564,9 @@ if use_offline_sample_data:
         universe_note = f"Offline sample mode enabled ({len(sample_df)} sample rows)."
     except Exception as exc:
         universe_note = f"Offline sample load failed: {exc}"
+elif uploaded_tickers:
+    tickers = uploaded_tickers
+    universe_note = f"Using uploaded tickers CSV ({len(tickers)} tickers)."
 elif manual_tickers:
     tickers = manual_tickers
     universe_note = f"Using custom universe ({len(tickers)} tickers)."
@@ -2563,9 +2610,15 @@ except Exception as exc:
 # Dynamic Terminal Header — uses cfg / universe_note resolved above
 # ---------------------------------------------------------------------------
 
-_mode_chip_text = "Offline Sample" if use_offline_sample_data else ("Custom" if manual_tickers else "Auto")
+_mode_chip_text = (
+    "Offline Sample"
+    if use_offline_sample_data
+    else ("Uploaded CSV" if uploaded_tickers else ("Custom" if manual_tickers else "Auto"))
+)
 if use_offline_sample_data:
     _univ_chip_label = "Offline Sample"
+elif uploaded_tickers:
+    _univ_chip_label = f"Upload ({len(uploaded_tickers)})"
 elif manual_tickers:
     _univ_chip_label = f"Custom ({len(manual_tickers)})"
 elif universe_source.startswith("S&P 500"):
@@ -2720,7 +2773,7 @@ with tab1:
             st.dataframe(universe_preview, use_container_width=True)
     elif tickers:
         st.caption(universe_note)
-        if manual_tickers:
+        if uploaded_tickers or manual_tickers:
             st.caption(", ".join(tickers[:30]) + (" ..." if len(tickers) > 30 else ""))
         else:
             st.dataframe(universe_preview.head(20), use_container_width=True)
@@ -2745,7 +2798,7 @@ with tab1:
                     st.error(f"Failed to load sample screen data: {exc}")
             else:
                 with st.spinner("Screening..."):
-                    tickers_to_run = manual_tickers.copy()
+                    tickers_to_run = uploaded_tickers.copy() if uploaded_tickers else manual_tickers.copy()
                     universe_preview_to_show = pd.DataFrame()
                     run_universe_note = universe_note
                     if not tickers_to_run:
@@ -2775,7 +2828,7 @@ with tab1:
                             st.error(f"Auto universe load failed: {exc}")
                             tickers_to_run = []
                     if not tickers_to_run:
-                        st.error("No valid universe available. Enter custom tickers or retry auto universe load.")
+                        st.error("No valid universe available. Upload tickers CSV, enter custom tickers, or retry auto universe load.")
                         st.stop()
                     start_download = (as_of_ts - pd.Timedelta(days=500)).strftime("%Y-%m-%d")
                     end_download = (as_of_ts + pd.Timedelta(days=5)).strftime("%Y-%m-%d")
