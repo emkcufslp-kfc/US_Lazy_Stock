@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date
 from io import StringIO
+import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -441,6 +442,174 @@ def load_market_cap_yf(ticker: str) -> float:
     except Exception:
         pass
     return np.nan
+
+
+def get_fmp_api_key() -> str:
+    try:
+        if "FMP_API_KEY" in st.secrets and str(st.secrets["FMP_API_KEY"]).strip():
+            return str(st.secrets["FMP_API_KEY"]).strip()
+    except Exception:
+        pass
+    return os.getenv("FMP_API_KEY", "").strip()
+
+
+FMP_BASE_URL = "https://financialmodelingprep.com/stable"
+
+
+def _fmp_get_json(endpoint: str, params: Dict[str, object], api_key: str) -> object:
+    query = dict(params or {})
+    if api_key:
+        query["apikey"] = api_key
+    resp = requests.get(
+        endpoint,
+        params=query,
+        timeout=20,
+        headers={"User-Agent": "USLazyStock/1.0 (fmp-audit)"},
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _fmp_rows(payload: object) -> List[dict]:
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict):
+        if isinstance(payload.get("historical"), list):
+            return [row for row in payload["historical"] if isinstance(row, dict)]
+        return [payload]
+    return []
+
+
+def _fmp_pick_number(row: dict, keys: List[str]) -> float:
+    for key in keys:
+        value = row.get(key)
+        if value is None or pd.isna(value):
+            continue
+        try:
+            return float(value)
+        except Exception:
+            continue
+    return np.nan
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def load_fmp_profile_audit(ticker: str, api_key: str) -> Dict[str, object]:
+    try:
+        payload = _fmp_get_json(f"{FMP_BASE_URL}/profile", {"symbol": ticker.upper()}, api_key)
+        rows = _fmp_rows(payload)
+        row = rows[0] if rows else {}
+        return {
+            "company_name": row.get("companyName") or row.get("name") or row.get("symbol") or "N/A",
+            "sector": row.get("sector") or "N/A",
+            "business_nature": row.get("industry") or row.get("sector") or "N/A",
+            "market_cap_fmp": _fmp_pick_number(row, ["marketCap", "mktCap", "marketcap"]),
+        }
+    except Exception:
+        return {"company_name": "N/A", "sector": "N/A", "business_nature": "N/A", "market_cap_fmp": np.nan}
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def load_fmp_close_on_or_before(ticker: str, as_of_date: str, api_key: str) -> float:
+    try:
+        as_of = pd.Timestamp(as_of_date)
+        payload = _fmp_get_json(
+            f"{FMP_BASE_URL}/historical-price-eod/full",
+            {
+                "symbol": ticker.upper(),
+                "from": (as_of - pd.Timedelta(days=14)).strftime("%Y-%m-%d"),
+                "to": as_of.strftime("%Y-%m-%d"),
+            },
+            api_key,
+        )
+        rows = _fmp_rows(payload)
+        if not rows:
+            return np.nan
+        df = pd.DataFrame(rows)
+        if "date" not in df.columns:
+            return np.nan
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["close"] = pd.to_numeric(df.get("close"), errors="coerce")
+        temp = df[(df["date"].notna()) & (df["date"] <= as_of)].sort_values("date")
+        if temp.empty:
+            return np.nan
+        close = temp.iloc[-1].get("close", np.nan)
+        return float(close) if pd.notna(close) else np.nan
+    except Exception:
+        return np.nan
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def load_fmp_fundamentals_audit(ticker: str, as_of_date: str, api_key: str) -> Dict[str, float]:
+    try:
+        q_income = _fmp_rows(
+            _fmp_get_json(
+                f"{FMP_BASE_URL}/income-statement",
+                {"symbol": ticker.upper(), "period": "quarter", "limit": 8},
+                api_key,
+            )
+        )
+        a_income = _fmp_rows(
+            _fmp_get_json(
+                f"{FMP_BASE_URL}/income-statement",
+                {"symbol": ticker.upper(), "period": "annual", "limit": 4},
+                api_key,
+            )
+        )
+        a_balance = _fmp_rows(
+            _fmp_get_json(
+                f"{FMP_BASE_URL}/balance-sheet-statement",
+                {"symbol": ticker.upper(), "period": "annual", "limit": 4},
+                api_key,
+            )
+        )
+
+        q_df = pd.DataFrame(q_income)
+        if not q_df.empty and "date" in q_df.columns:
+            q_df["date"] = pd.to_datetime(q_df["date"], errors="coerce")
+            q_df = q_df.sort_values("date")
+            eps_col = next((c for c in ["eps", "epsdiluted", "epsDiluted", "eps_basic", "epsBasic"] if c in q_df.columns), None)
+            rev_col = next((c for c in ["revenue", "Revenue", "totalRevenue"] if c in q_df.columns), None)
+            eps_q = pd.to_numeric(q_df[eps_col], errors="coerce").dropna() if eps_col else pd.Series(dtype=float)
+            rev_q = pd.to_numeric(q_df[rev_col], errors="coerce").dropna() if rev_col else pd.Series(dtype=float)
+        else:
+            eps_q = pd.Series(dtype=float)
+            rev_q = pd.Series(dtype=float)
+
+        eps_yoy = (eps_q / eps_q.shift(4) - 1.0) * 100.0 if len(eps_q) >= 5 else pd.Series(dtype=float)
+        rev_yoy = (rev_q / rev_q.shift(4) - 1.0) * 100.0 if len(rev_q) >= 5 else pd.Series(dtype=float)
+        eps_yoy = eps_yoy.dropna()
+        rev_yoy = rev_yoy.dropna()
+
+        inc_df = pd.DataFrame(a_income)
+        bal_df = pd.DataFrame(a_balance)
+        roe_year_vals = pd.Series(dtype=float)
+        if not inc_df.empty and not bal_df.empty and "date" in inc_df.columns and "date" in bal_df.columns:
+            inc_df["date"] = pd.to_datetime(inc_df["date"], errors="coerce")
+            bal_df["date"] = pd.to_datetime(bal_df["date"], errors="coerce")
+            inc_df = inc_df.sort_values("date")
+            bal_df = bal_df.sort_values("date")
+            ni_col = next((c for c in ["netIncome", "netIncomeLoss", "net_income"] if c in inc_df.columns), None)
+            eq_col = next((c for c in ["totalStockholdersEquity", "totalEquity", "stockholdersEquity", "shareholdersEquity"] if c in bal_df.columns), None)
+            if ni_col and eq_col:
+                merged = pd.merge(
+                    inc_df[["date", ni_col]].rename(columns={ni_col: "net_income"}),
+                    bal_df[["date", eq_col]].rename(columns={eq_col: "equity"}),
+                    on="date",
+                    how="inner",
+                )
+                merged["net_income"] = pd.to_numeric(merged["net_income"], errors="coerce")
+                merged["equity"] = pd.to_numeric(merged["equity"], errors="coerce")
+                merged = merged[(merged["equity"].notna()) & (merged["equity"] != 0)].sort_values("date")
+                if not merged.empty:
+                    roe_year_vals = (merged["net_income"] / merged["equity"]) * 100.0
+
+        return {
+            "eps_yoy_fmp": float(eps_yoy.iloc[-1]) if not eps_yoy.empty else np.nan,
+            "rev_yoy_fmp": float(rev_yoy.iloc[-1]) if not rev_yoy.empty else np.nan,
+            "roe_avg_fmp": float(roe_year_vals.tail(3).mean()) if not roe_year_vals.empty else np.nan,
+        }
+    except Exception:
+        return {"eps_yoy_fmp": np.nan, "rev_yoy_fmp": np.nan, "roe_avg_fmp": np.nan}
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
@@ -1469,6 +1638,9 @@ def screen_on_date(
     enable_live_fundamentals: bool = True,
     enable_sec_audit: bool = False,
     sec_audit_limit: int = 50,
+    enable_fmp_audit: bool = False,
+    fmp_audit_limit: int = 25,
+    fmp_api_key: str = "",
 ) -> pd.DataFrame:
     price_data = download_price_history(tickers, start_download, end_download)
     price_data = {t: add_indicators(df) for t, df in price_data.items()}
@@ -1529,6 +1701,55 @@ def screen_on_date(
             sec_rev_yoy = sec.get("rev_yoy_sec", np.nan)
             sec_roe_avg = sec.get("roe_avg_sec", np.nan)
 
+        fmp_company_name = "N/A"
+        fmp_sector = "N/A"
+        fmp_business_nature = "N/A"
+        fmp_market_cap = np.nan
+        fmp_close = np.nan
+        fmp_close_diff_pct = np.nan
+        fmp_eps_yoy = np.nan
+        fmp_rev_yoy = np.nan
+        fmp_roe_avg = np.nan
+        fmp_validation_status = "not_checked"
+        if enable_fmp_audit and idx < int(fmp_audit_limit) and fmp_api_key:
+            fmp_profile = load_fmp_profile_audit(ticker, fmp_api_key)
+            fmp_company_name = str(fmp_profile.get("company_name", "N/A"))
+            fmp_sector = str(fmp_profile.get("sector", "N/A"))
+            fmp_business_nature = str(fmp_profile.get("business_nature", "N/A"))
+            fmp_market_cap = fmp_profile.get("market_cap_fmp", np.nan)
+            fmp_close = load_fmp_close_on_or_before(ticker, as_of_date.strftime("%Y-%m-%d"), fmp_api_key)
+            fmp_fund = load_fmp_fundamentals_audit(ticker, as_of_date.strftime("%Y-%m-%d"), fmp_api_key)
+            fmp_eps_yoy = fmp_fund.get("eps_yoy_fmp", np.nan)
+            fmp_rev_yoy = fmp_fund.get("rev_yoy_fmp", np.nan)
+            fmp_roe_avg = fmp_fund.get("roe_avg_fmp", np.nan)
+
+            validation_flags: List[str] = []
+            close_val = tech.get("close")
+            if pd.notna(fmp_close) and close_val is not None and pd.notna(close_val) and float(close_val) != 0:
+                fmp_close_diff_pct = (float(fmp_close) / float(close_val) - 1.0) * 100.0
+                if abs(float(fmp_close_diff_pct)) > 1.5:
+                    validation_flags.append("price")
+            if pd.notna(fmp_eps_yoy) and pd.notna(fund.get("eps_yoy_value")):
+                if abs(float(fmp_eps_yoy) - float(fund.get("eps_yoy_value"))) > 8.0:
+                    validation_flags.append("eps")
+            if pd.notna(fmp_rev_yoy) and pd.notna(fund.get("rev_yoy_value")):
+                if abs(float(fmp_rev_yoy) - float(fund.get("rev_yoy_value"))) > 8.0:
+                    validation_flags.append("revenue")
+            if pd.notna(fmp_roe_avg) and pd.notna(fund.get("roe_avg")):
+                if abs(float(fmp_roe_avg) - float(fund.get("roe_avg"))) > 5.0:
+                    validation_flags.append("roe")
+            if pd.notna(fmp_market_cap) and pd.notna(fund.get("market_cap_value")) and float(fund.get("market_cap_value")) != 0:
+                market_cap_diff_pct = (float(fmp_market_cap) / float(fund.get("market_cap_value")) - 1.0) * 100.0
+                if abs(float(market_cap_diff_pct)) > 5.0:
+                    validation_flags.append("market_cap")
+            fmp_validation_status = "ok" if not validation_flags else "mismatch:" + ",".join(validation_flags)
+            if profile.get("company_name") == "N/A" and fmp_company_name != "N/A":
+                profile["company_name"] = fmp_company_name
+            if profile.get("sector") == "N/A" and fmp_sector != "N/A":
+                profile["sector"] = fmp_sector
+            if profile.get("business_nature") == "N/A" and fmp_business_nature != "N/A":
+                profile["business_nature"] = fmp_business_nature
+
         rows.append({
             "ticker": ticker,
             "company_name": profile.get("company_name", "N/A"),
@@ -1569,6 +1790,16 @@ def screen_on_date(
             "audit_eps_yoy_sec": sec_eps_yoy,
             "audit_rev_yoy_sec": sec_rev_yoy,
             "audit_roe_avg_sec": sec_roe_avg,
+            "audit_company_name_fmp": fmp_company_name,
+            "audit_sector_fmp": fmp_sector,
+            "audit_business_nature_fmp": fmp_business_nature,
+            "audit_market_cap_fmp": fmp_market_cap,
+            "audit_close_fmp": fmp_close,
+            "audit_close_diff_pct_fmp": fmp_close_diff_pct,
+            "audit_eps_yoy_fmp": fmp_eps_yoy,
+            "audit_rev_yoy_fmp": fmp_rev_yoy,
+            "audit_roe_avg_fmp": fmp_roe_avg,
+            "audit_validation_status_fmp": fmp_validation_status,
             "fundamentals_used": fund.get("fundamentals_used"),
             "fundamentals_source": fund.get("fundamentals_source"),
             "note": fund.get("note") or tech.get("note"),
@@ -2467,6 +2698,11 @@ with st.sidebar:
     enable_live_fundamentals = st.checkbox("Auto-fill fundamentals values (Yahoo free)", value=False)
     enable_sec_audit = st.checkbox("Enable 2nd fundamentals audit (SEC free)", value=False)
     sec_audit_limit = st.number_input("SEC audit max tickers", min_value=10, max_value=300, value=50, step=10)
+    enable_fmp_audit = st.checkbox("Enable 2nd resource validation (FMP)", value=False)
+    fmp_audit_limit = st.number_input("FMP audit max tickers", min_value=5, max_value=250, value=25, step=5)
+    fmp_api_key = get_fmp_api_key()
+    if enable_fmp_audit and not fmp_api_key:
+        st.warning("FMP validation is enabled, but no API key was found in `st.secrets` or the `FMP_API_KEY` environment variable.")
 
     st.markdown('<hr style="border-color:var(--border);margin:10px 0;">', unsafe_allow_html=True)
     st.markdown("**▸ Rules**")
@@ -2845,6 +3081,9 @@ with tab1:
                         enable_live_fundamentals=bool(enable_live_fundamentals),
                         enable_sec_audit=bool(enable_sec_audit),
                         sec_audit_limit=int(sec_audit_limit),
+                        enable_fmp_audit=bool(enable_fmp_audit),
+                        fmp_audit_limit=int(fmp_audit_limit),
+                        fmp_api_key=str(fmp_api_key),
                     )
                     st.session_state["screen_universe_note"] = run_universe_note
                     st.session_state["screen_universe_preview"] = universe_preview_to_show
@@ -2947,6 +3186,16 @@ with tab1:
                 "ret_63d",
                 "audit_close_stooq",
                 "audit_close_diff_pct",
+                "audit_company_name_fmp",
+                "audit_sector_fmp",
+                "audit_business_nature_fmp",
+                "audit_market_cap_fmp",
+                "audit_close_fmp",
+                "audit_close_diff_pct_fmp",
+                "audit_eps_yoy_fmp",
+                "audit_rev_yoy_fmp",
+                "audit_roe_avg_fmp",
+                "audit_validation_status_fmp",
             ]
             available_passed_cols = [c for c in preferred_passed_cols if c in passed.columns]
             st.dataframe(

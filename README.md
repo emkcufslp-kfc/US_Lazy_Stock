@@ -53,6 +53,23 @@ streamlit run app/us_stock_monitor_app.py
 - Turn off `Use offline sample data (no live API)`.
 - Provide custom tickers or let the app build an auto-universe from free sources.
 - Optionally upload fundamentals CSV (`data/fundamentals_snapshot_template.csv` as template).
+- To enable FMP validation, set `FMP_API_KEY` in Streamlit secrets or the environment.
+
+### FMP key setup
+
+Streamlit secrets:
+
+```toml
+# .streamlit/secrets.toml
+FMP_API_KEY = "your_key_here"
+```
+
+Environment variable:
+
+```powershell
+$env:FMP_API_KEY="your_key_here"
+python -m streamlit run app/us_stock_monitor_app.py
+```
 
 ## Validation
 

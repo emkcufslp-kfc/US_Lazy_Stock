@@ -24,3 +24,4 @@ Build a production-style Streamlit dashboard for US stock screening and watchlis
 ## Data Sources
 - Offline: `data/full_screen_latest.csv` and `data/fundamentals_snapshot_template.csv`.
 - Optional online: Yahoo Finance, SEC company facts, S&P/NASDAQ free endpoints.
+- Secondary validation: Financial Modeling Prep free/basic API when `FMP_API_KEY` is configured in Streamlit secrets or the environment.
